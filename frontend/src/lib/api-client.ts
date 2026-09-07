@@ -9,7 +9,13 @@
  *     of parsing prose.
  */
 
+import type { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+
+/** Option shapes are derived from the library so they cannot drift out of sync. */
+export type RegistrationOptions = Parameters<typeof startRegistration>[0];
+export type AuthenticationOptions = Parameters<typeof startAuthentication>[0];
 
 export class ApiError extends Error {
   constructor(
@@ -68,11 +74,18 @@ export interface Payee {
 }
 
 export interface StepUpChallenge {
-  token: string;
   prompt: string;
   payeeName: string;
   amountFormatted: string;
   expiresInSeconds: number;
+  /** 3, 2, 1. At 0 the transaction is terminally blocked — there is no retry. */
+  attemptsRemaining: number;
+}
+
+export interface TimelineEvent {
+  at: string;
+  event: string;
+  data: Record<string, unknown>;
 }
 
 export type AuthorizeResult =
@@ -89,14 +102,20 @@ export type AuthorizeResult =
 export const api = {
   // Identity
   registerOptions: (email: string) =>
-    request<never>('/auth/register/options', { method: 'POST', body: JSON.stringify({ email }) }),
+    request<RegistrationOptions>('/auth/register/options', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
   registerVerify: (email: string, response: unknown) =>
     request<{ userId: string; displayName: string }>('/auth/register/verify', {
       method: 'POST',
       body: JSON.stringify({ email, response }),
     }),
   loginOptions: (email: string) =>
-    request<never>('/auth/login/options', { method: 'POST', body: JSON.stringify({ email }) }),
+    request<AuthenticationOptions>('/auth/login/options', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
   loginVerify: (email: string, response: unknown) =>
     request<{ userId: string; displayName: string }>('/auth/login/verify', {
       method: 'POST',
@@ -121,11 +140,13 @@ export const api = {
     }),
   /** Server-authoritative details. The review screen renders ONLY this. */
   payment: (txId: string) => request<TransactionView>(`/payment/${txId}`),
-  challenge: (txId: string) => request<never>(`/payment/${txId}/challenge`, { method: 'POST' }),
-  authorize: (txId: string, assertion: unknown, deliberationMs: number) =>
+  /** Options whose `challenge` IS the intent hash — the core binding. */
+  challenge: (txId: string) =>
+    request<AuthenticationOptions>(`/payment/${txId}/challenge`, { method: 'POST' }),
+  authorize: (txId: string, assertion: unknown) =>
     request<AuthorizeResult>(`/payment/${txId}/authorize`, {
       method: 'POST',
-      body: JSON.stringify({ assertion, deliberationMs }),
+      body: JSON.stringify({ assertion }),
     }),
   stepUp: (txId: string, answer: string) =>
     request<{ ok: true; next: 'REAUTHORIZE' }>(`/payment/${txId}/step-up`, {
@@ -133,17 +154,22 @@ export const api = {
       body: JSON.stringify({ answer }),
     }),
 
-  // QR
-  qr: (txId: string) => request<{ token: string; expiresInSeconds: number }>(`/qr/${txId}`),
-  redeemQr: (token: string) =>
-    request<TransactionView>('/qr/redeem', { method: 'POST', body: JSON.stringify({ token }) }),
+  // QR — payee mints a request, payer scans it
+  /** Payee side: a signed, single-use, 60s payment request to show as a QR. */
+  requestQr: (amountMinor: number) =>
+    request<{ token: string; expiresInSeconds: number }>('/qr/request', {
+      method: 'POST',
+      body: JSON.stringify({ amountMinor }),
+    }),
+  /** Payer side: scanning returns a fully locked transaction of the payer's own. */
+  scanQr: (token: string) =>
+    request<TransactionView>('/qr/scan', { method: 'POST', body: JSON.stringify({ token }) }),
 
   // Audit
   timeline: (txId: string) =>
-    request<{
-      transaction: TransactionView;
-      events: { at: string; event: string; data: Record<string, unknown> }[];
-    }>(`/transactions/${txId}/timeline`),
+    request<{ transaction: TransactionView; events: TimelineEvent[] }>(
+      `/transactions/${txId}/timeline`
+    ),
   history: () => request<TransactionView[]>('/transactions'),
 
   // Devices

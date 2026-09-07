@@ -38,12 +38,18 @@ async function seed() {
   // Two known payees Asha has paid before, plus one external stranger the
   // risk engine has never seen — that stranger is the QR-swap / scam-call
   // recipient in the attack demos.
+  // Two payees Asha pays regularly, and three she has never paid. The
+  // strangers are what make the risk demo work: a never-paid recipient is the
+  // strongest single signal the engine has, so the same amount to Priya and to
+  // RAJESH K reaches two different decisions.
   const { rows: accounts } = await query<{ id: string; handle: string }>(
     `INSERT INTO accounts (user_id, display_name, handle, balance_minor, is_external) VALUES
-       ($1, 'Asha Menon',    'asha@prism',    $3, FALSE),
-       ($2, 'Priya Sharma',  'priya@prism',   $4, FALSE),
-       (NULL, 'Kumar Stores','kumar@prism',   $5, TRUE),
-       (NULL, 'RAJESH K',    'rajesh@prism',  0,  TRUE)
+       ($1, 'Asha Menon',       'asha@prism',    $3, FALSE),
+       ($2, 'Priya Sharma',     'priya@prism',   $4, FALSE),
+       (NULL, 'Kumar Stores',   'kumar@prism',   $5, TRUE),
+       (NULL, 'Meena Electricals','meena@prism', $5, TRUE),
+       (NULL, 'RAJESH K',       'rajesh@prism',  0,  TRUE),
+       (NULL, 'SafeAccount Verify','safeacct@prism', 0, TRUE)
      RETURNING id, handle`,
     [asha.id, priya.id, rupees(120000), rupees(8000), rupees(15000)]
   );
@@ -108,7 +114,8 @@ async function seed() {
   console.log('[Seed] Done.');
   console.log(`  users:        Asha Menon (asha@prism.demo), Priya Sharma (priya@prism.demo)`);
   console.log(`  accounts:     asha@prism ₹1,20,000 · priya@prism ₹8,000`);
-  console.log(`                kumar@prism (known payee) · rajesh@prism (never paid — the stranger)`);
+  console.log(`                known payees:  kumar@prism · meena@prism`);
+  console.log(`                never paid:    rajesh@prism · safeacct@prism`);
   console.log(`  history:      ${seeded} settled payments over 60 days, ₹200–₹2,000, evenings`);
 }
 

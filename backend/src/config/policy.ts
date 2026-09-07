@@ -26,16 +26,70 @@ export const policy = {
 
   currency: 'INR',
 
-  /** Semantic step-up: "enter the last two digits of the amount". */
+  /**
+   * Below this, an approval counts as reflexive rather than considered.
+   * Measured server-side from the CHALLENGE_ISSUED audit row — never from a
+   * value the client sends, which would let an attacker opt out of the signal.
+   */
+  hastyApprovalMs: 1500,
+
+  /**
+   * Amount deviation, graded rather than binary.
+   *
+   * A payment 4x the payer's usual is odd; one 60x their usual is a different
+   * kind of event, and collapsing both into one signal meant a stranger could
+   * never be blocked on amount alone no matter how large the sum. Multiples
+   * are of the payer's largest settled payment, so they mean nothing until
+   * there is history — which is why the seed provides some.
+   */
+  amountAnomalyMultiple: 3,
+  amountExtremeMultiple: 50,
+
+  /**
+   * Fastest plausible ground/air travel between two authentications, km/h.
+   * 900 is roughly a commercial jet: below it, two sightings are explainable;
+   * above it, one of them was not the account holder.
+   *
+   * Only used when both requests can be located. See geoForIp() in
+   * modules/context/network.ts — we deliberately ship no geolocation source,
+   * so this threshold is correct and currently unreachable.
+   */
+  maxPlausibleKmH: 900,
+
+  /**
+   * Semantic step-up: "enter the last two digits of the amount".
+   *
+   * maxAttempts is counted PER TRANSACTION, not per issued challenge. That
+   * distinction is the whole control: a two-digit answer is guessable in 100
+   * tries, so a cap that resets whenever a fresh challenge is issued caps
+   * nothing. attemptTtlSeconds therefore outlives the intent window, so the
+   * counter cannot be aged out faster than the transaction it guards.
+   */
   stepUp: {
     ttlSeconds: 180,
     maxAttempts: 3,
+    attemptTtlSeconds: 900,
   },
 
-  /** Adaptive risk engine. Score is additive points from the rules below. */
+  /**
+   * Adaptive risk engine. Score is additive points from the rules in
+   * modules/risk/riskEngine.ts.
+   *
+   * blockThreshold is 85, not 75, and the reason is load-bearing: a genuine
+   * user on a genuine device being talked into paying a stranger scores 75
+   * (NEW_PAYEE + AMOUNT_ANOMALY + HASTY_APPROVAL). At a threshold of 75 that
+   * blocks outright — which sounds safe but is wrong twice over. It skips
+   * semantic verification, the only control that addresses manipulation of a
+   * genuine user, and it refuses a payment that may well be legitimate
+   * without ever asking the person.
+   *
+   * 85 leaves a real step-up band: manipulation gets a comprehension check,
+   * while a stolen device (which also trips NEW_DEVICE) still blocks.
+   * riskEngine.test.ts asserts all four outcomes — run it after any change.
+   */
   risk: {
     stepUpThreshold: 40,
-    blockThreshold: 75,
+    blockThreshold: 85,
   },
 
   rateLimit: {

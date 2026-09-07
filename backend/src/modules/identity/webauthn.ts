@@ -149,7 +149,16 @@ export class IdentityModule {
 
     const options = await generateAuthenticationOptions({
       rpID: config.webauthn.rpId,
-      challenge: intentHash,
+      // Pass the raw 32 hash bytes, NOT the base64url string.
+      //
+      // generateAuthenticationOptions base64url-encodes whatever challenge it
+      // is handed. Given the already-encoded intent hash it encodes it again,
+      // so the authenticator signs base64url(base64url(hash)) while
+      // verifyAuthenticationResponse expects base64url(hash) — every payment
+      // then fails with SIG_INVALID for a reason that looks nothing like an
+      // encoding bug. Handing over the raw bytes makes the challenge the
+      // browser sees byte-identical to transactions.intent_hash.
+      challenge: Buffer.from(intentHash, 'base64url'),
       allowCredentials: creds.map((c) => ({
         id: Buffer.from(c.id, 'base64url'),
         type: 'public-key' as const,

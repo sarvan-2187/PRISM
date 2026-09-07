@@ -124,6 +124,127 @@ Two rules that cause the most expensive bugs if broken:
 1. **Money is integer minor units (paise).** ₹5,000 is `500000`.
 2. **No endpoint takes a `userId`.** The payer comes from the session cookie.
 
+---
+
+## Risk scoring — the points rules
+
+The risk engine is rules-first and never a model: every decision can name the
+exact conditions that fired, because an unexplainable block cannot be audited,
+contested, or debugged. Each rule is independent and pure, so the score is just
+a sum. Source of truth: `RULES` in
+[`backend/src/modules/risk/riskEngine.ts`](backend/src/modules/risk/riskEngine.ts).
+
+| Rule | Points | Fires when | Reason shown to the user |
+|---|---:|---|---|
+| `NEW_DEVICE` | 35 | A baseline exists for this user but the device fingerprint differs | This device has not been used for payments before |
+| `NEW_PAYEE` | 30 | Payer has never paid this recipient | You have never paid this recipient before |
+| `AMOUNT_ANOMALY` | 30 | Amount is 3–50× the payer's largest settled payment | Amount is far larger than your usual payments |
+| `AMOUNT_EXTREME` | 55 | Amount is over 50× that largest payment | Amount is vastly larger than anything you have sent before |
+| `NO_BASELINE` | 25 | No context baseline recorded for this user yet | No established pattern for this session yet |
+| `HASTY_APPROVAL` | 15 | Approved < 1500 ms after the details appeared (measured server-side from the `CHALLENGE_ISSUED` audit row) | Payment approved unusually quickly after the details appeared |
+| `NETWORK_CHANGED` | 10 | Request arrives from a different network than the baseline | Connecting from a different network than usual |
+
+Score is the sum of fired rules, capped at 100, then routed:
+
+| Score | Decision |
+|---|---|
+| 0 – 39 | **APPROVE** — settle |
+| 40 – 84 | **STEP_UP** — semantic verification required |
+| 85 – 100 | **BLOCK** — terminal, no retry path |
+
+Thresholds live in `policy.risk` in
+[`backend/src/config/policy.ts`](backend/src/config/policy.ts); the amount
+multiples and the 1500 ms hasty window live there too. Multiples are relative
+to the payer's largest *settled* payment, so they mean nothing until there is
+history — which is why the seed provides some.
+
+Two pairs are mutually exclusive by construction, so nothing is ever scored
+twice for the same fact: `NO_BASELINE` and `NEW_DEVICE` (you cannot differ from
+a baseline that does not exist), and `AMOUNT_ANOMALY` and `AMOUNT_EXTREME`
+(bands, not thresholds). The context module also computes an `impossibleTravel`
+signal, but PRISM deliberately ships no geolocation source, so it has no rule
+and never fires.
+
+**Why the block threshold is 85 and not 75.** A genuine user, on their own
+device, being talked into paying a stranger scores 75
+(`NEW_PAYEE` + `AMOUNT_ANOMALY` + `HASTY_APPROVAL`). Blocking at 75 sounds
+safer but is wrong twice: it skips semantic verification — the only control
+that addresses a manipulated genuine user — and it refuses a possibly
+legitimate payment without ever asking the person. At 85 that case lands in
+the step-up band, while a stolen device (which also trips `NEW_DEVICE`, 110 →
+capped 100) still blocks outright.
+
+Worked examples:
+
+| Situation | Rules fired | Score | Outcome |
+|---|---|---:|---|
+| Known device, known payee, normal amount | — | 0 | APPROVE |
+| Known device, first payment to a new payee | `NEW_PAYEE` | 30 | APPROVE |
+| Social engineering: new payee, 5× usual, approved instantly | `NEW_PAYEE` + `AMOUNT_ANOMALY` + `HASTY_APPROVAL` | 75 | STEP_UP |
+| Stolen device paying a stranger a large sum | `NEW_DEVICE` + `NEW_PAYEE` + `AMOUNT_ANOMALY` | 95 | BLOCK |
+| Known device, 60× usual amount to a new payee | `NEW_PAYEE` + `AMOUNT_EXTREME` | 85 | BLOCK |
+
+Adding a rule is one entry in `RULES` — no engine change, no schema change, no
+UI change; the reason string flows through to the timeline on its own. All four
+outcomes are pinned by `riskEngine.test.ts`, so run `npm test` after touching
+any number above.
+
+> `PRISM_DISABLE=riskEngine` fires no rules at all (score 0, everything
+> approves). That switch exists for the attack demo's "before" state and is
+> refused entirely when `NODE_ENV=production`.
+
+---
+
+## Semantic verification (what STEP_UP actually does)
+
+Every other layer answers "is this the right **person**, on the right
+**device**, approving the right **transaction**?" In social-engineering fraud
+the answer to all three is *yes* and the money is still stolen — the victim
+really is the account holder, really is holding their own phone, and really is
+approving the exact payment the scammer wants. Semantic verification is the
+only layer that asks a different question: **does the user understand what they
+are about to do?**
+
+**The challenge.** PRISM shows the payee and the amount taken from the *locked*
+database record — never from client input — and asks the payer to type the last
+two digits of the amount in rupees (`⌊amountMinor / 100⌋ % 100`, so ₹4,750.00 →
+`50`). It is deliberately *not* another biometric prompt: a thumb can be pressed
+reflexively while someone talks over the phone; reading the real number off the
+screen and typing it cannot be done without looking at it.
+
+**The attempt cap is the load-bearing part.** A two-digit answer is guessable in
+100 tries, so this control is only as strong as its cap:
+
+- `policy.stepUp.maxAttempts` = **3**, counted **per transaction**, not per
+  issued challenge, in its own Redis key outside the challenge record. An
+  earlier version kept the counter inside the record, so re-authorizing handed
+  out a fresh challenge with attempts back at zero — roughly 34 re-approvals
+  covered the whole keyspace.
+- Exhausting the cap **blocks the transaction terminally** (`markFailed → BLOCKED`).
+  There is no reset path; a genuine user starts a new payment, which is a new
+  intent with a new hash and a new nonce.
+- The counter's TTL (900 s) outlives the 90 s intent window, so it cannot be
+  aged out faster than the transaction it guards. Wrong answers use `INCR`, so
+  two concurrent guesses cannot spend the same attempt.
+- The challenge is bound to `intentHash` — re-locking the transaction
+  invalidates any outstanding challenge (`TAMPER_BLOCKED`).
+- A wrong answer does *not* destroy the challenge; a mistyping user just tries
+  again. Destroying it per guess protected nothing (the cap is per transaction)
+  while forcing an honest payer to re-approve with their passkey.
+
+**Passing is remembered per transaction.** On success PRISM sets a
+`stepup:passed:<txId>` flag. Approval still requires a fresh
+transaction-bound WebAuthn assertion, and that re-authorization re-runs the
+risk engine — which, with the same signals, would demand the same check
+forever. So a `STEP_UP` is downgraded to `APPROVE` when that transaction has
+already passed. A `BLOCK` is **never** downgraded, and the flag is keyed to the
+transaction so it cannot carry over to a different payment.
+
+**Honest limitation.** A sufficiently pressured victim may still read the digits
+aloud and type them. This adds friction and clarity at the decisive moment; it
+is not a cure.
+
+
 ⚠️ Sections below this line still describe the original scaffold (Next.js,
 USD, the old folder layout) and are being rewritten — trust the table above.
 
@@ -200,8 +321,8 @@ USD, the old folder layout) and are being rewritten — trust the table above.
 
 4. RISK EVALUATION
    Context: compare device fingerprint vs baseline → driftScore
-   RiskEngine: combine velocity + amount + drift → risk score
-   → APPROVE (score < 0.4) | STEP_UP (< 0.75) | BLOCK (≥ 0.75)
+   RiskEngine: sum the points rules that fired (see "Risk scoring" above)
+   → APPROVE (< 40) | STEP_UP (40–84) | BLOCK (≥ 85)
 
 5. STEP-UP (if required)
    Semantic: generate challenge text from locked DB record

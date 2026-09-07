@@ -30,3 +30,5 @@ Thumbs.db
 # TypeScript build cache
 *.tsbuildinfo
 .claude/
+# S2 personal working notes (local only, not part of the submission)
+S2-PLAN/

@@ -349,26 +349,49 @@ router.post(
 // QR — an authenticated pointer, never a source of truth
 // ──────────────────────────────────────────────────────────────
 
-router.get(
-  '/qr/:txId',
+// NOTE (S2 -> S1): these two replace GET /qr/:txId and POST /qr/redeem.
+// The old pair had the PAYER minting a QR for their own transaction, which is
+// backwards from the fraud in the problem statement (Asha scans the shop's
+// code), and POST /qr/redeem had no ownership check, so any signed-in user
+// could read any transaction's payee and amount. Sanjay: review and adjust the
+// wiring as you see fit — the module contract is createRequest() / scan().
+
+/** Payee side: mint a signed, single-use payment request to display as a QR. */
+router.post(
+  '/qr/request',
   requireSession,
   wrap(async (req, res) => {
-    const tx = await intentLock.get(req.params.txId);
-    if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
-    res.json(await dynamicQr.issue(tx.id, tx.intent_hash));
+    const payeeAccount = await accountFor(req.userId!);
+    res.status(201).json(
+      await dynamicQr.createRequest(payeeAccount.id, Number(req.body.amountMinor))
+    );
   })
 );
 
+/**
+ * Payer side: scan a request and lock an intent from it.
+ *
+ * The payee and amount come from the server's own records, never from the
+ * scanned code — so a swapped sticker can point at an attacker but cannot
+ * make the attacker look like the shop.
+ */
 router.post(
-  '/qr/redeem',
+  '/qr/scan',
   requireSession,
   wrap(async (req, res) => {
-    const payload = await dynamicQr.redeem(String(req.body.token ?? ''));
-    const tx = await intentLock.get(payload.tx);
-    // The QR's claimed hash must match the locked record, and the details the
-    // client renders come from the record — never from the code.
-    if (payload.ih !== tx.intent_hash) fail('TAMPER_BLOCKED', { reason: 'QR points at stale intent' });
-    res.json(await present(tx));
+    const request = await dynamicQr.scan(String(req.body.token ?? ''));
+    const payerAccount = await accountFor(req.userId!);
+    if (request.payeeAccountId === payerAccount.id) {
+      fail('QR_INVALID_SIGNATURE', { reason: 'cannot pay yourself' });
+    }
+
+    const locked = await intentLock.lock({
+      payerUserId: req.userId!,
+      payerAccountId: payerAccount.id,
+      payeeAccountId: request.payeeAccountId,
+      amountMinor: request.amountMinor,
+    });
+    res.status(201).json(await present(await intentLock.get(locked.txId)));
   })
 );
 

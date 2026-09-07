@@ -251,3 +251,141 @@ button + button {
   color: var(--text-dim);
   font-size: 13px;
 }
+
+/* ── Transaction detail ─────────────────────────────────────── */
+
+.detail {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 20px;
+  margin: 0;
+  align-items: baseline;
+}
+
+.detail dt {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.detail dd {
+  margin: 0;
+}
+
+.amount {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/*
+ * The step-up sentence. This is the one line a manipulated user has to
+ * actually read, so the emphasis comes from type size and breathing room
+ * rather than a coloured stripe — a bigger sentence is harder to skim past
+ * than a decorated one.
+ */
+.callout {
+  margin: 18px 0;
+  padding: 20px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 19px;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.callout strong {
+  font-weight: 650;
+}
+
+.reasons {
+  margin: 12px 0;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.reasons li {
+  margin-bottom: 4px;
+}
+
+/* ── Security timeline ──────────────────────────────────────── */
+
+.timeline {
+  list-style: none;
+  margin: 20px 0 0;
+  padding: 0 0 0 20px;
+  border-left: 2px solid var(--border);
+}
+
+.timeline li {
+  position: relative;
+  padding: 0 0 18px 4px;
+}
+
+.timeline li::before {
+  content: '';
+  position: absolute;
+  left: -27px;
+  top: 5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  border: 2px solid var(--bg);
+}
+
+.timeline li.tone-ok::before {
+  background: var(--ok);
+}
+.timeline li.tone-warn::before {
+  background: var(--warn);
+}
+.timeline li.tone-danger::before {
+  background: var(--danger);
+}
+
+.tl-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.tl-label {
+  font-weight: 550;
+}
+
+.tl-detail {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* A link wrapping a button must not add its own underline or spacing. */
+a:has(> button) {
+  display: block;
+  text-decoration: none;
+}
+
+/* ── Demo scenario presets ──────────────────────────────────── */
+
+.presets {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.preset {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  font-weight: 450;
+}
+
+.preset + .preset {
+  margin-top: 8px;
+}

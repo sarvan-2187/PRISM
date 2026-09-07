@@ -13,6 +13,7 @@
 import { ContextSignals } from '../context/fingerprint';
 import { policy, isDisabled } from '../../config/policy';
 import { audit } from '../audit/logger';
+import { semantic } from '../semantic/intentCheck';
 import { query } from '../../db/pool';
 
 export type RiskDecision = 'APPROVE' | 'STEP_UP' | 'BLOCK';
@@ -56,6 +57,12 @@ export const RULES: RiskRule[] = [
     reason: 'Amount is far larger than your usual payments',
   },
   {
+    id: 'AMOUNT_EXTREME',
+    points: 55,
+    when: (s) => s.amountExtreme,
+    reason: 'Amount is vastly larger than anything you have sent before',
+  },
+  {
     id: 'HASTY_APPROVAL',
     points: 15,
     when: (s) => s.hastyApproval,
@@ -67,6 +74,15 @@ export const RULES: RiskRule[] = [
     when: (s) => s.networkChanged,
     reason: 'Connecting from a different network than usual',
   },
+  {
+    // Weighted high because there is no innocent explanation: the account was
+    // in two places at once, so one of the two was not the account holder.
+    // Cannot fire in this build — see geoForIp() in modules/context/network.ts.
+    id: 'IMPOSSIBLE_TRAVEL',
+    points: 50,
+    when: (s) => s.impossibleTravel,
+    reason: 'Account used from two places too far apart to travel between',
+  },
 ];
 
 export interface RiskResult {
@@ -76,22 +92,47 @@ export interface RiskResult {
   firedRuleIds: string[];
 }
 
+/**
+ * Pure scoring. No database, no audit, no side effects — which is what lets
+ * riskEngine.test.ts assert the whole decision ladder in milliseconds and
+ * makes threshold tuning something you can reason about rather than guess at.
+ */
+export function scoreSignals(signals: RiskSignals): RiskResult {
+  const fired = isDisabled('riskEngine') ? [] : RULES.filter((r) => r.when(signals));
+  const score = Math.min(
+    100,
+    fired.reduce((sum, r) => sum + r.points, 0)
+  );
+
+  const decision: RiskDecision =
+    score >= policy.risk.blockThreshold
+      ? 'BLOCK'
+      : score >= policy.risk.stepUpThreshold
+        ? 'STEP_UP'
+        : 'APPROVE';
+
+  return {
+    score,
+    decision,
+    reasons: fired.map((r) => r.reason),
+    firedRuleIds: fired.map((r) => r.id),
+  };
+}
+
 export class RiskEngineModule {
   async evaluate(txId: string, userId: string, signals: RiskSignals): Promise<RiskResult> {
-    const fired = isDisabled('riskEngine') ? [] : RULES.filter((r) => r.when(signals));
-    const score = Math.min(
-      100,
-      fired.reduce((sum, r) => sum + r.points, 0)
-    );
+    const scored = scoreSignals(signals);
+    let { decision, reasons } = scored;
+    const { score, firedRuleIds } = scored;
 
-    const decision: RiskDecision =
-      score >= policy.risk.blockThreshold
-        ? 'BLOCK'
-        : score >= policy.risk.stepUpThreshold
-          ? 'STEP_UP'
-          : 'APPROVE';
-
-    const reasons = fired.map((r) => r.reason);
+    // Asking for the same comprehension check twice is not extra security, it
+    // is a loop: passing the check requires a fresh assertion, and that
+    // re-authorization lands back here with the same signals. A BLOCK is never
+    // downgraded — only STEP_UP, and only for the transaction that passed.
+    if (decision === 'STEP_UP' && (await semantic.hasPassed(txId))) {
+      decision = 'APPROVE';
+      reasons = [...reasons, 'Comprehension already verified for this payment'];
+    }
 
     await query('UPDATE transactions SET risk_score = $2, risk_reasons = $3 WHERE id = $1', [
       txId,
@@ -102,10 +143,10 @@ export class RiskEngineModule {
     await audit.log('RISK_EVALUATED', {
       transactionId: txId,
       userId,
-      data: { score, decision, firedRuleIds: fired.map((r) => r.id) },
+      data: { score, decision, firedRuleIds },
     });
 
-    return { score, decision, reasons, firedRuleIds: fired.map((r) => r.id) };
+    return { score, decision, reasons, firedRuleIds };
   }
 }
 
