@@ -209,6 +209,28 @@ export default function Landing() {
     if (!loading && me) navigate('/home', { replace: true });
   }, [loading, me, navigate]);
 
+  async function devLogin() {
+    setBusy('login');
+    setError(null);
+    try {
+      const r = await fetch(
+        `${import.meta.env.VITE_API_URL ?? 'http://localhost:4000'}/api/v1/auth/dev-login`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ email }),
+        }
+      );
+      if (!r.ok) throw new Error('dev-login unavailable (production build?)');
+      await refresh();
+      navigate('/home');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setBusy(null);
+    }
+  }
+
   async function run(mode: 'register' | 'login') {
     setBusy(mode);
     setError(null);
@@ -353,6 +375,14 @@ export default function Landing() {
                 {busy === 'register'
                   ? 'Waiting for your passkey…'
                   : 'Register a passkey on this device'}
+              </Button>
+              <Button
+                block
+                variant="ghost"
+                onClick={devLogin}
+                disabled={busy !== null}
+              >
+                Demo login (no passkey)
               </Button>
 
               {error && (

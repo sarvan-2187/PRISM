@@ -14,7 +14,6 @@ import fs from 'fs';
 import path from 'path';
 import pool, { query } from './pool';
 import { config } from '../config/env';
-import { createSoftCredential } from '../modules/identity/softAuthenticator';
 
 const API = `http://localhost:${config.port}/api/v1`;
 const STATE_PATH = path.join(__dirname, '..', '..', '..', 'attacks', '.state.json');
@@ -45,27 +44,14 @@ async function api(
 async function provision(email: string): Promise<{ userId: string; cookie: string }> {
   const u = await query<{ id: string }>('SELECT id FROM users WHERE email = $1', [email]);
   if (!u.rows[0]) throw new Error(`no user ${email} — run npm run db:seed`);
-  const userId = u.rows[0].id;
 
-  // Hold the private key ourselves, so replace whatever passkey is there.
-  const cred = createSoftCredential(userId);
-  await query('DELETE FROM credentials WHERE user_id = $1', [userId]);
-  await query(
-    `INSERT INTO credentials (id, user_id, public_key, counter, device_type, backed_up, transports)
-     VALUES ($1, $2, $3, 0, 'singleDevice', false, '{internal}')`,
-    [cred.credentialId, userId, cred.cosePublicKey]
-  );
-
-  const opts = await api('POST', '/auth/login/options', { email });
-  if (opts.status !== 200) throw new Error(`login/options ${email}: ${JSON.stringify(opts.body)}`);
-  const verify = await api('POST', '/auth/login/verify', {
-    email,
-    response: cred.sign(opts.body.challenge),
-  });
-  if (verify.status !== 200 || !verify.cookie) {
-    throw new Error(`login/verify ${email}: ${verify.status} ${JSON.stringify(verify.body)}`);
+  // Use the dev-login shortcut — it never touches the account's real passkeys,
+  // so a passkey registered in the browser for the same demo keeps working.
+  const r = await api('POST', '/auth/dev-login', { email });
+  if (r.status !== 200 || !r.cookie) {
+    throw new Error(`dev-login ${email}: ${r.status} ${JSON.stringify(r.body)}`);
   }
-  return { userId, cookie: verify.cookie };
+  return { userId: u.rows[0].id, cookie: r.cookie };
 }
 
 async function main(): Promise<void> {
