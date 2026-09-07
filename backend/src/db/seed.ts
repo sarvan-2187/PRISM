@@ -55,6 +55,30 @@ async function seed() {
   );
   const byHandle = Object.fromEntries(accounts.map((a) => [a.handle, a.id]));
 
+  // ── Team accounts ───────────────────────────────────────────────────
+  // Four internal PRISM users, one passkey-holding account each, ₹1,00,000
+  // opening balance. Unlike the external payees above, each of these can sign in
+  // with its own passkey and both send and receive. opening_balance_minor is
+  // fixed up by the reconciliation pass below (no ledger history => opening ==
+  // balance).
+  const team: Array<[string, string, string]> = [
+    ['sanjay@prism.demo', 'Sanjay', 'sanjay@prism'],
+    ['rohith@prism.demo', 'Rohith', 'rohith@prism'],
+    ['sarvan@prism.demo', 'Sarvan', 'sarvan@prism'],
+    ['chetan@prism.demo', 'Chetan', 'chetan@prism'],
+  ];
+  for (const [email, name, handle] of team) {
+    const { rows } = await query<{ id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING id`,
+      [email, name]
+    );
+    await query(
+      `INSERT INTO accounts (user_id, display_name, handle, balance_minor, is_external)
+       VALUES ($1, $2, $3, $4, FALSE)`,
+      [rows[0].id, name, handle, rupees(100000)]
+    );
+  }
+
   // ── Synthetic history ───────────────────────────────────────────────
   // ~20 settled payments over the last 60 days: small amounts, two familiar
   // payees, evenings and weekday afternoons. This is Asha's "normal".
@@ -135,6 +159,7 @@ async function seed() {
   console.log(`  accounts:     asha@prism ₹1,20,000 · priya@prism ₹8,000`);
   console.log(`                known payees:  kumar@prism · meena@prism`);
   console.log(`                never paid:    rajesh@prism · safeacct@prism`);
+  console.log(`  team:         sanjay@prism · rohith@prism · sarvan@prism · chetan@prism (₹1,00,000 each)`);
   console.log(`  history:      ${seeded} settled payments over 60 days, ₹200–₹2,000, evenings`);
 }
 
