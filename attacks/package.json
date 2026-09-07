@@ -1,0 +1,24 @@
+{
+  "name": "prism-attacks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PRISM S3 — adversarial test suite. Targets localhost only.",
+  "type": "module",
+  "scripts": {
+    "setup": "node setup/provision.mjs",
+    "attack:all": "node run_all.mjs",
+    "attack:tamper": "node 01-transaction-tampering/attack.mjs",
+    "attack:replay": "node 02-replay-settled-transaction/attack.mjs",
+    "attack:expiry": "node 03-expired-intent/attack.mjs",
+    "attack:qr-forged": "node 04-qr-forged-signature/attack.mjs",
+    "attack:qr-replay": "node 05-qr-replay/attack.mjs",
+    "attack:qr-expired": "node 06-qr-expired/attack.mjs",
+    "attack:idor": "node 07-idor-cross-user/attack.mjs",
+    "attack:ratelimit": "node 08-rate-limit-bruteforce/attack.mjs",
+    "attack:jwt": "node 09-session-jwt-tamper/attack.mjs",
+    "attack:stepup": "node 10-semantic-stepup-bruteforce/attack.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.47.0"
+  }
+}
