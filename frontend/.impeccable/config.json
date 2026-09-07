@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "createdAt": "2026-09-07T18:34:57.542Z",
+        "reason": "User's own DESIGN_SYSTEM.md sections 1 and 2 specify Geist for all interface text, paired with Instrument Serif for editorial headings; the serif carries the distinctive voice."
+      }
+    ]
+  }
+}

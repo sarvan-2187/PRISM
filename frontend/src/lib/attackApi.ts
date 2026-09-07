@@ -7,7 +7,13 @@
  * The token is never persisted to localStorage — only sessionStorage (cleared
  * when the tab closes) — and it is sent to nowhere but this backend.
  */
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+/*
+ * Empty by default so requests are relative and travel through the Vite
+ * proxy. A hardcoded localhost:4000 points at the VISITOR's own machine, so
+ * every call fails with ERR_CONNECTION_REFUSED on any device but the host.
+ * Same rule as lib/api-client.ts.
+ */
+const API_URL = import.meta.env.VITE_API_URL ?? '';
 const TOKEN_KEY = 'prism_attack_token';
 
 export class AttackApiError extends Error {

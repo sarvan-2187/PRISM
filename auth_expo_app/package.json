@@ -1,0 +1,31 @@
+{
+  "name": "prism-authenticator",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "test": "tsx lib/otp.test.ts"
+  },
+  "private": true,
+  "dependencies": {
+    "@expo-google-fonts/geist": "^0.4.2",
+    "@expo-google-fonts/geist-mono": "^0.4.3",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "expo": "^57.0.20",
+    "expo-camera": "~57.0.4",
+    "expo-font": "~57.0.3",
+    "expo-secure-store": "~57.0.3",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "@types/react": "^19.2.18",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

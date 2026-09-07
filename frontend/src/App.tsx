@@ -41,7 +41,10 @@ import AttackDashboard from '@/pages/attacks/Dashboard';
 import AttackDetail from '@/pages/attacks/AttackDetail';
 
 /** Views that get the wide column. Everything else is the focused flow. */
-const WIDE = ['/home', '/profile', '/policy', '/attacks'];
+const WIDE = ['/home', '/profile', '/settings', '/policy', '/attacks'];
+
+/** Wide also covers nested pages, e.g. /attacks/:scenarioId. */
+const isWide = (p: string) => WIDE.some((w) => p === w || p.startsWith(w + '/'));
 
 const NAV = [
   { to: '/home', label: 'Home' },
@@ -70,7 +73,7 @@ function Shell() {
   const { pathname } = useLocation();
   const { me, signOut } = useSession();
 
-  const wide = WIDE.includes(pathname) || pathname.startsWith('/attacks');
+  const wide = isWide(pathname);
   // The landing hero runs edge to edge and under the header, so on that one
   // route the shell stops constraining and the header stops painting.
   const bleed = pathname === '/';
@@ -191,6 +194,16 @@ function Shell() {
           <Route path="/pay/:txId/timeline" element={guard(<Timeline />)} />
           <Route path="/receive" element={guard(<Receive />)} />
           <Route path="/scan" element={guard(<Scan />)} />
+          <Route path="/profile" element={guard(<Profile />)} />
+          <Route path="/settings" element={guard(<Settings />)} />
+          {/*
+            The Attack Lab is gated by the operator token, not a PRISM
+            session: the operator is a judge or demonstrator, not an account
+            holder. Wrapping it in RequireSession would lock out the very
+            person it exists for.
+          */}
+          <Route path="/attacks" element={<AttackDashboard />} />
+          <Route path="/attacks/:scenarioId" element={<AttackDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
 

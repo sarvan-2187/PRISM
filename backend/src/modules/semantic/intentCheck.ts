@@ -192,6 +192,44 @@ export class SemanticModule {
     await audit.log('STEP_UP_PASSED', { transactionId: tx.id, userId: tx.payer_user_id });
   }
 
+  /**
+   * Same cap, same audit events and same single-use pass flag as verify(),
+   * but the correctness decision is made elsewhere — by the paired
+   * Authenticator, whose code is an HMAC over this transaction's intent hash.
+   *
+   * Sharing this path is the point: three wrong codes close the transaction
+   * exactly as three wrong digits would, and neither challenge can be used to
+   * escape the other's counter.
+   */
+  async verifyExternal(tx: TransactionRow, correct: boolean): Promise<void> {
+    if ((await this.attemptCount(tx.id)) >= policy.stepUp.maxAttempts) {
+      await this.exhaust(tx);
+      fail('STEP_UP_FAILED', { reason: 'verification attempts exhausted', attemptsRemaining: 0 });
+    }
+
+    if (!correct) {
+      const used = await redis.incr(attemptsKey(tx.id));
+      await redis.expire(attemptsKey(tx.id), policy.stepUp.attemptTtlSeconds);
+      const exhausted = used >= policy.stepUp.maxAttempts;
+      await audit.log('STEP_UP_FAILED', {
+        transactionId: tx.id,
+        userId: tx.payer_user_id,
+        data: { attemptsUsed: used, exhausted, mode: 'AUTHENTICATOR' },
+      });
+      if (exhausted) await this.exhaust(tx);
+      fail('STEP_UP_FAILED', {
+        attemptsRemaining: Math.max(0, policy.stepUp.maxAttempts - used),
+      });
+    }
+
+    await redis.set(passedKey(tx.id), '1', 'EX', policy.nonceTtlSeconds);
+    await audit.log('STEP_UP_PASSED', {
+      transactionId: tx.id,
+      userId: tx.payer_user_id,
+      data: { mode: 'AUTHENTICATOR' },
+    });
+  }
+
   /** Has this exact transaction already cleared a comprehension check? */
   async hasPassed(txId: string): Promise<boolean> {
     return (await redis.get(passedKey(txId))) === '1';

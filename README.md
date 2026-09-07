@@ -192,6 +192,169 @@ harmless on localhost, so there is nothing else to revert.
 
 ---
 
+## Mobile — two Expo apps
+
+PRISM ships two phone apps, and they are not the same product.
+
+| | `auth_expo_app/` | `prism_expo_app/` |
+|---|---|---|
+| **What it is** | **PRISM Authenticator** — a second factor | **PRISM App** — the portal itself |
+| **Who it is for** | Someone paying on a laptop | Someone paying on a phone |
+| **What it does** | Shows a 6-digit code that approves one payment | Balance, statement, send, receive, scan, timeline |
+| **Backend** | The web backend, `:4000` | Its own server, `:4100`, same database |
+
+Both are Expo Go apps: no development build, no EAS, no native modules beyond
+what Expo Go already bundles.
+
+### The constraint both apps are shaped by
+
+**React Native has no `navigator.credentials`.** A native passkey needs an EAS
+development build *plus* `assetlinks.json` / AASA served from a real HTTPS
+domain, neither of which exists on `prism.local`. So a phone cannot hold a
+PRISM passkey, and everything below follows from that one fact.
+
+The answer in both apps is the same primitive:
+
+```
+code = HMAC-SHA256(device_secret, binding)
+     → dynamic truncation (RFC 4226 §5.3) → % 1_000_000 → 6 digits
+```
+
+`binding` is whatever is being authorized — an intent hash for a payment, a
+login challenge for a sign-in. **There is no time counter.** TOTP needs one
+because a login has no other freshness source; PRISM's flows have the intent
+nonce and its TTL. Dropping it removes clock skew as a failure mode and makes
+the code deterministic per transaction, which is why **the phone works with no
+network at all**.
+
+The same fixture is asserted on both sides — `backend/src/modules/authenticator/otp.test.ts`
+(node:crypto) and each app's `lib/otp.test.ts` (@noble/hashes) — so the two
+implementations cannot silently diverge:
+
+```
+approval 944316 · denial 047685
+```
+
+---
+
+### 1. PRISM Authenticator (`auth_expo_app/`)
+
+Turns a refusal into an escalation. A payment the risk engine scores too high
+used to dead-end with `403`; with a paired phone it becomes *"approve this on
+your other device"*.
+
+**Workflow**
+
+1. **Pair.** Portal → **Settings → Authenticator → Pair a phone**. The server
+   mints a secret and draws it as a QR (`prism://pair?d=…&s=…`). The phone
+   photographs it and **never sends it back** — on a plain-HTTP LAN a secret
+   POSTed from the phone would be readable on the wire. Same shape as an
+   `otpauth://` enrolment URI. Confirm on the laptop, because
+   `/authenticator/pair/confirm` needs a session and the phone has none.
+2. **Pay** something the engine flags, or **₹50,000 or more**, which always
+   requires the phone (`HIGH_VALUE_AUTHENTICATOR`).
+3. The Verify screen shows a **signed** challenge as a QR with a **60-second**
+   countdown. Signed matters: the app renders the payee and amount *from the
+   token*, so an unsigned one would let anyone who can draw a QR choose what
+   the second device displays — precisely the fraud it exists to catch.
+4. **Scan it.** The app verifies the Ed25519 signature against
+   `/.well-known/prism-keys`, then shows the amount, the recipient and the
+   6 digits. Works in airplane mode.
+5. **Type the code.** The payment settles. The 60-second window is enforced
+   server-side against a Redis record, not by the phone's clock.
+
+**"This isn't me."** The app can also derive `HMAC(secret, hash + ":deny")` —
+six digits indistinguishable from an approval. A victim being coached through
+a transfer can read it out and quarantine the payment, and nobody watching can
+tell. ⛔ **The server route for this is not wired yet**; the button computes a
+real code that nothing currently accepts.
+
+---
+
+### 2. PRISM App (`prism_expo_app/`)
+
+The whole portal on a phone: sign in, balance, Cr/Dr statement, send, review,
+approve, step-up, receive by QR, scan, security timeline.
+
+**Architecture.** `prism_expo_app/backend/` is a second Express server on
+`:4100` sharing the web stack's Postgres and Redis. It **re-implements nothing
+that decides whether money moves** — intent lock, context, risk, policy
+firewall, attestation chain and settlement are imported from `backend/` and run
+unchanged. Sharing the database is the point: a payment made on the phone lands
+in the same ledger the website reads.
+
+**Workflow**
+
+1. **Pair from the web portal** (as above). Pairing is the bootstrap: the app
+   has no password and no passkey, so the secret is the only thing that
+   proves which account this phone belongs to.
+2. **Sign in.** The server issues a random challenge; the phone answers with
+   `HMAC(secret, challenge)`. The session comes back as a Bearer token, because
+   React Native's `fetch` keeps no cookie jar. Same signed token the browser
+   gets in its cookie.
+3. **Send.** Pick a recipient, enter an amount, and the intent locks.
+4. **Review.** Every value is read back from `GET /payment/:id` — never from
+   navigation state. A payee carried in a route param is a payee an attacker
+   can set.
+5. **Approve.** Face ID / fingerprint first, then the app derives
+   `HMAC(secret, intent_hash)` and sends it. The payment settles.
+
+**Biometrics** gate three things: approving a payment, opening the app (it
+locks whenever backgrounded, because the stored secret can authorize
+payments), and the destructive actions in Settings.
+
+#### ⚠ The mobile path is weaker than the web path, and says so
+
+| | Passkey (`WEBAUTHN_APPROVED`) | Device code (`DEVICE_APPROVED`) |
+|---|---|---|
+| Key material | Private key, never leaves the device | **Shared secret** — the server has a copy |
+| Bound to the transaction | Yes, signature over the intent hash | Yes, HMAC over the intent hash |
+| Tamper / replay resistance | Equal | Equal |
+| Survives a server compromise | Yes | **No** — a stolen database could forge one |
+
+Tampering and replay fail identically on both. **Key custody does not.** So the
+attestation chain records `DEVICE_APPROVED`, never `WEBAUTHN_APPROVED`, and the
+timeline reads *"Approved on a paired device, not a passkey"*. The audit trail
+must never claim a stronger proof than the one that happened.
+
+`expo-local-authentication` is a **local** check — WebAuthn carries user
+verification inside the signature, this does not. The server records
+`biometricClaimed: true` and the field is named *claimed* deliberately.
+
+**A step-up on the phone falls back to the digits quiz**, never to another code
+from the same device: asking the phone that just approved for a second HMAC
+from the same secret proves nothing new.
+
+---
+
+### Running the mobile apps
+
+```bash
+# 1. The web stack must be up (Postgres, Redis, backend, portal)
+cd backend && npm run dev            # :4000
+cd frontend && npm run dev           # :5173
+
+# 2. The PRISM App's own API
+cd prism_expo_app/backend && npm run dev    # :4100
+
+# 3. Either app's Metro bundler
+cd prism_expo_app/frontend && npx expo start --lan
+cd auth_expo_app && npx expo start --lan
+```
+
+On the phone, open **Expo Go** → *Enter URL manually* → `exp://<LAN-IP>:8081`.
+
+**The address you give the app is the backend directly** — `http://<LAN-IP>:4100`
+for the PRISM App, `http://<LAN-IP>:4000` for the Authenticator. **Not**
+`https://prism.local:5173`: a phone cannot resolve `prism.local` and does not
+trust the mkcert CA. React Native is not subject to CORS, and with no WebAuthn
+there is no secure-context requirement.
+
+> Restart Metro after installing any dependency. Its module map is built at
+> startup, so a package added while it is running resolves as missing.
+
+---
+
 ## Current state (M0 complete)
 
 | Area | State |
@@ -201,7 +364,9 @@ harmless on localhost, so there is nothing else to revert.
 | Passkey register / login / session cookie | ✅ working |
 | Intent lock, nonce lifecycle, audit log | ✅ working |
 | Context, risk engine, semantic step-up, Ed25519 QR, ledger | ✅ implemented, needs end-to-end testing |
-| Frontend | ⚠️ Vite + React scaffold; sign-in works, payment screens are owned stubs |
+| Frontend | ✅ every screen built: home, send, review, step-up, status, timeline, receive, scan, settings, policy |
+| PRISM Authenticator (`auth_expo_app/`) | ✅ pairing and payment step-up verified; ⛔ denial route not wired |
+| PRISM App (`prism_expo_app/`) | ✅ device sign-in, statement, send, approve, receive, scan, timeline |
 | Attack scripts | ⛔ not started (S3) |
 
 **Read [`PLAN.md`](PLAN.md) before starting.** It carries the task breakdown,

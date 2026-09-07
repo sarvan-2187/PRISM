@@ -21,6 +21,13 @@ export interface FirewallInput {
   tx: TransactionRow;
   signals: ContextSignals;
   isDuressCredential: boolean;
+  /**
+   * The payer has an ACTIVE PRISM Authenticator device paired.
+   * Optional so a caller that predates the feature still compiles; absent is
+   * read as "no second device", which is the safe reading (refuse rather
+   * than escalate).
+   */
+  hasAuthenticator?: boolean;
 }
 
 export class PolicyFirewallModule {
@@ -55,6 +62,7 @@ export class PolicyFirewallModule {
       isAmendment: tx.amended_from !== null,
       settledTodayMinor: parseInt(rows[0].total, 10),
       hour: new Date().getHours(),
+      hasAuthenticator: input.hasAuthenticator ?? false,
     });
   }
 }

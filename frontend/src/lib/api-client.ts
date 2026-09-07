@@ -71,6 +71,28 @@ export interface TransactionView {
   riskScore: number | null;
   riskReasons: string[];
   failureCode: string | null;
+  /** Server-recorded entry point; QR requests get an extra safety explanation. */
+  origin: 'MANUAL' | 'QR';
+  /** Which challenge a stepped-up transaction is waiting on. */
+  stepUpMode?: 'SEMANTIC' | 'AUTHENTICATOR' | null;
+}
+
+/**
+ * A history row. `direction` says which way the money went and
+ * `counterparty` is whoever is at the other end, so the UI never has to work
+ * out whether payeeName means "them" or "me".
+ */
+export interface StatementEntry extends TransactionView {
+  direction: 'SENT' | 'RECEIVED';
+  counterpartyName: string;
+  counterpartyHandle: string;
+}
+
+export interface AuthenticatorDevice {
+  id: string;
+  label: string | null;
+  createdAt: string;
+  confirmedAt: string | null;
 }
 
 export interface Payee {
@@ -104,7 +126,14 @@ export type AuthorizeResult =
       balanceMinor: number;
       balanceFormatted: string;
     }
-  | { decision: 'STEP_UP'; score: number; reasons: string[]; challenge: StepUpChallenge };
+  | {
+      /** STEP_UP: risk engine. CONFIRM_CHANGE: policy REQUIRE_SEMANTIC. */
+      decision: 'STEP_UP' | 'CONFIRM_CHANGE';
+      score: number;
+      reasons: string[];
+      changes?: unknown;
+      challenge: StepUpChallenge;
+    };
 
 export const api = {
   // Identity
@@ -155,6 +184,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ assertion }),
     }),
+  /** The signed challenge the PRISM Authenticator scans. AUTHENTICATOR mode only. */
+  stepUpToken: (txId: string) =>
+    request<{ token: string; expiresInSeconds: number }>(`/payment/${txId}/step-up/token`),
   stepUp: (txId: string, answer: string) =>
     request<{ ok: true; next: 'REAUTHORIZE' }>(`/payment/${txId}/step-up`, {
       method: 'POST',
@@ -177,7 +209,8 @@ export const api = {
     request<{ transaction: TransactionView; events: TimelineEvent[] }>(
       `/transactions/${txId}/timeline`
     ),
-  history: () => request<TransactionView[]>('/transactions'),
+  /** Statement: money out at any status, money in once settled. */
+  history: () => request<StatementEntry[]>('/transactions'),
 
   // Devices
   credentials: () =>
@@ -194,6 +227,41 @@ export const api = {
       riskThresholds: { stepUpThreshold: number; blockThreshold: number };
       disabledControls: string[];
     }>('/policy'),
+
+  // ── Authenticator (paired second device) ─────────────────────────────
+
+  /** Is there an active paired phone? Drives the Settings tab. */
+  authenticator: () =>
+    request<{ paired: boolean; device: AuthenticatorDevice | null }>('/authenticator'),
+
+  /**
+   * Mint a PENDING device and its secret.
+   *
+   * The secret is returned so the browser can DRAW it as a QR. It is never
+   * sent back from the phone: on a plain-HTTP LAN a returned secret would be
+   * readable on the wire. Same shape as an otpauth:// enrolment URI.
+   */
+  pairStart: () =>
+    request<{ deviceId: string; secret: string; expiresAt: string; expiresInSeconds: number }>(
+      '/authenticator/pair/start',
+      { method: 'POST' }
+    ),
+
+  /**
+   * Activate the pending device.
+   *
+   * Called from the PORTAL, not the phone: the route requires a session and
+   * the phone has no cookie. The user confirms here after scanning.
+   */
+  pairConfirm: (deviceId: string) =>
+    request<{ ok: true }>('/authenticator/pair/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ deviceId }),
+    }),
+
+  /** Lost phone. One-way, exactly like revoking a passkey. */
+  authenticatorRevoke: () =>
+    request<{ ok: true }>('/authenticator/revoke', { method: 'POST' }),
 
   // ── Cards ───────────────────────────────────────────────────────────
   // PENDING BACKEND (requested from S1). Both calls 404 until the cards

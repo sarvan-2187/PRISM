@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "PRISM Authenticator",
+    "slug": "prism-authenticator",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "prism",
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#050505"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "PRISM Authenticator uses the camera to scan pairing and payment codes. Nothing is uploaded."
+      }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "PRISM Authenticator uses the camera to scan pairing and payment codes. Nothing is uploaded."
+        }
+      ],
+      "expo-secure-store",
+      "expo-font"
+    ]
+  }
+}

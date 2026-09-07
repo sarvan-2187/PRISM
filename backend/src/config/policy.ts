@@ -69,7 +69,26 @@ export const policy = {
     ttlSeconds: 180,
     maxAttempts: 3,
     attemptTtlSeconds: 900,
+    /*
+     * How long a PRISM Authenticator code is accepted for.
+     *
+     * Deliberately shorter than the 180s semantic window. The six digits are
+     * read aloud off a phone screen, which is exactly the moment a coached
+     * victim is most exposed, so the window in which a relayed code is worth
+     * anything stays small. Enforced server-side against an issued-at record,
+     * NOT by a clock on the phone: the code itself is derived from the intent
+     * hash alone, so a drifted phone clock can never break the demo.
+     */
+    authenticatorTtlSeconds: 60,
   },
+
+  /*
+   * At or above this, a payment cannot be approved by the laptop alone: the
+   * paired phone must produce a code. Above it the loss from one coerced
+   * approval stops being recoverable, so the evidence bar rises with the
+   * amount rather than staying flat.
+   */
+  highValueMinor: 5_000_000,
 
   /**
    * Adaptive risk engine. Score is additive points from the rules in
@@ -97,8 +116,13 @@ export const policy = {
     defaultWindowMs: 15 * 60 * 1000,
     defaultMax: 300,
     // Strict where an attacker would brute-force: two-digit answers, auth.
+    // Raised from 20 for the multi-laptop demo: several people registering
+    // and retrying on one network exhausted 20/5min in normal use. A
+    // two-digit code needs up to 100 guesses, so 60 still trips before it
+    // can be exhausted, and the semantic check's own 3-attempt-per-payment
+    // cap is the primary defence regardless. Restore 20 after the demo.
     strictWindowMs: 5 * 60 * 1000,
-    strictMax: 20,
+    strictMax: 60,
   },
 
   /**

@@ -89,7 +89,12 @@ export default function Review() {
       const assertion = await webauthn.approve(options);
       const result = await api.authorize(txId, assertion);
 
-      if (result.decision === 'STEP_UP') {
+      // Two server decisions both mean "a comprehension check is pending":
+      // STEP_UP from the risk engine, CONFIRM_CHANGE from the policy
+      // firewall's REQUIRE_SEMANTIC outcome. Matching only the first sent
+      // the user to Status while a challenge sat waiting, which looked like
+      // the second passkey prompt never happening.
+      if (result.decision === 'STEP_UP' || result.decision === 'CONFIRM_CHANGE') {
         navigate(`/pay/${txId}/verify`);
         return;
       }

@@ -24,6 +24,7 @@ import {
   generateKeyPair,
   importPKCS8,
   exportPKCS8,
+  exportJWK,
   type JWTPayload,
   type KeyLike,
 } from 'jose';
@@ -214,6 +215,20 @@ export class KeyManagementModule {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The published QR-signing public key.
+   *
+   * The Authenticator app verifies step-up challenge tokens with this before
+   * displaying the payee and amount. If it did not, an attacker who can
+   * render a QR would control what the second device shows the user, which
+   * is exactly the fraud the second device exists to catch. Public half
+   * only: verification needs nothing secret.
+   */
+  async qrPublicKey(): Promise<{ kid: string; alg: 'EdDSA'; jwk: crypto.JsonWebKey }> {
+    const { publicKey, kid } = await qrKeys();
+    return { kid, alg: 'EdDSA', jwk: (await exportJWK(publicKey)) as crypto.JsonWebKey };
   }
 
   /** The published receipt key, as a JWK plus a PEM for offline verifiers. */

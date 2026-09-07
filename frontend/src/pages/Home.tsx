@@ -9,8 +9,15 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { KeyRound, QrCode, RefreshCw, Radiation } from 'lucide-react';
-import { api, ApiError, TransactionView } from '@/lib/api-client';
+import {
+  ArrowDownLeft,
+  ArrowUpRight,
+  KeyRound,
+  QrCode,
+  RefreshCw,
+  Radiation,
+} from 'lucide-react';
+import { api, ApiError, StatementEntry } from '@/lib/api-client';
 import { demoSessionRevealEnabled, revealMySession } from '@/lib/demoSessionApi';
 import { useSession } from '@/lib/session';
 import { relativeTime } from '@/lib/format';
@@ -29,9 +36,18 @@ import {
   TableRow,
 } from '@/components/ui/table';
 
+/**
+ * Money in, from this account's point of view. Falls back to SENT for a
+ * backend that predates the direction field, so an older server degrades to
+ * the previous behaviour instead of mislabelling every row as a credit.
+ */
+function credit(tx: StatementEntry): boolean {
+  return tx.direction === 'RECEIVED';
+}
+
 export default function Home() {
   const { me, refresh } = useSession();
-  const [history, setHistory] = useState<TransactionView[] | null>(null);
+  const [history, setHistory] = useState<StatementEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
   const [labEnabled, setLabEnabled] = useState(false);
@@ -89,8 +105,9 @@ export default function Home() {
             {me ? `${me.displayName.split(' ')[0]}’s account` : 'Account'}
           </h1>
           <p className="mt-2 max-w-[60ch] text-pretty text-small text-secondary-foreground">
-            Every payment below was approved with a passkey signature over that transaction’s own
-            hash. Open one to see what PRISM checked before the money moved.
+            Money out and money in. Every debit here was approved by a passkey signature over
+            that transaction’s own hash; open any row to see what PRISM checked before the money
+            moved.
           </p>
         </div>
         <Button asChild className="max-md:w-full">
@@ -101,7 +118,7 @@ export default function Home() {
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,380px)] lg:items-start">
         <section>
           <div className="mb-4 flex items-baseline justify-between gap-4">
-            <h2 className="text-body-lg font-semibold">Payments sent</h2>
+            <h2 className="text-body-lg font-semibold">Transaction history</h2>
             <Button variant="ghost" size="sm" onClick={load} disabled={reloading}>
               <RefreshCw className={reloading ? 'animate-spin' : undefined} />
               {reloading ? 'Refreshing' : 'Refresh'}
@@ -134,10 +151,10 @@ export default function Home() {
 
           {history && history.length === 0 && (
             <div className="rounded-lg border border-dashed border-border-strong px-6 py-10 text-center">
-              <h3 className="font-semibold">No payments sent from this account</h3>
+              <h3 className="font-semibold">Nothing on this account yet</h3>
               <p className="mx-auto mt-2 max-w-[44ch] text-pretty text-small text-secondary-foreground">
-                This table lists payments you sent. Money you receive is not listed here, but it
-                does move your balance, and the Receive screen reports each payment as it lands.
+                Payments you send appear here as debits, and money that reaches you appears as
+                credits once it settles.
               </p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 <Button asChild variant="secondary">
@@ -155,7 +172,8 @@ export default function Home() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Recipient</TableHead>
+                    <TableHead className="w-10"><span className="sr-only">Direction</span></TableHead>
+                    <TableHead>Counterparty</TableHead>
                     <TableHead className="text-right">Amount</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead className="text-right max-sm:hidden">When</TableHead>
@@ -164,21 +182,51 @@ export default function Home() {
                 <TableBody>
                   {history.map((tx) => (
                     <TableRow key={tx.txId}>
+                      {/*
+                        Direction is carried by four channels, not just colour:
+                        the arrow's shape and rotation, the +/- sign, the Cr/Dr
+                        label, and the hue. Colour alone would vanish for a
+                        colour-blind reader and in forced-colors mode.
+                      */}
+                      <TableCell className="pr-0">
+                        {credit(tx) ? (
+                          <ArrowDownLeft
+                            className="size-5 shrink-0 text-success"
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <ArrowUpRight
+                            className="size-5 shrink-0 text-destructive"
+                            aria-hidden="true"
+                          />
+                        )}
+                      </TableCell>
                       <TableCell className="max-w-0">
                         <Link
                           to={`/pay/${tx.txId}/timeline`}
                           className="block rounded-sm font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         >
-                          {tx.payeeName}
+                          {tx.counterpartyName ?? tx.payeeName}
                         </Link>
                         <span className="block truncate text-caption text-secondary-foreground">
-                          {tx.payeeHandle}
+                          {credit(tx) ? 'from ' : 'to '}
+                          {tx.counterpartyHandle ?? tx.payeeHandle}
                           {tx.failureCode ? ` · ${tx.failureCode}` : ''}
                           {tx.riskReasons.length > 0 ? ` · ${tx.riskReasons[0]}` : ''}
                         </span>
                       </TableCell>
-                      <TableCell className="whitespace-nowrap text-right font-semibold tabular">
-                        {tx.amountFormatted}
+                      <TableCell className="whitespace-nowrap text-right">
+                        <span
+                          className={`font-semibold tabular ${
+                            credit(tx) ? 'text-success' : 'text-destructive'
+                          }`}
+                        >
+                          {credit(tx) ? '+' : '−'}
+                          {tx.amountFormatted}
+                        </span>
+                        <span className="ml-1.5 text-caption font-medium text-secondary-foreground">
+                          {credit(tx) ? 'Cr' : 'Dr'}
+                        </span>
                       </TableCell>
                       <TableCell>
                         <Badge variant={statusBadge(tx.status)}>
@@ -240,8 +288,9 @@ export default function Home() {
             </CardHeader>
             <CardContent>
               <Button asChild variant="secondary" block>
-                <Link to="/profile">Manage passkeys</Link>
+                <Link to="/settings">Manage passkeys</Link>
               </Button>
+
             </CardContent>
           </Card>
 
