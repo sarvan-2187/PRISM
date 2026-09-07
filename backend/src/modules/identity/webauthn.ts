@@ -17,6 +17,7 @@ import {
   generateAuthenticationOptions,
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
+import { isoBase64URL } from '@simplewebauthn/server/helpers';
 import type {
   RegistrationResponseJSON,
   AuthenticationResponseJSON,
@@ -139,9 +140,14 @@ export class IdentityModule {
    * Issue an assertion challenge bound to one exact transaction.
    *
    * `intentHash` is base64url of sha256(canonical intent) — the same string
-   * stored in transactions.intent_hash, passed through unchanged. No
-   * re-encoding happens anywhere in this path, which is what keeps the
-   * verification side honest.
+   * stored in transactions.intent_hash. It is handed to the library as the raw
+   * 32 sha256 bytes (`isoBase64URL.toBuffer`), NOT as a string: given a string,
+   * @simplewebauthn/server v9 treats it as arbitrary text and re-encodes it
+   * (base64url(utf8(intentHash))), so the browser would sign a value that is not
+   * the intent hash and verification — which compares against the raw hash —
+   * would always fail with SIG_INVALID. Passing bytes makes the library encode
+   * them straight back to `intentHash`, so `options.challenge` === the stored
+   * hash exactly, with zero re-encoding drift. This is the N1 mechanism.
    */
   async paymentChallenge(userId: string, txId: string, intentHash: string) {
     const creds = await this.credentialsFor(userId);
@@ -149,16 +155,8 @@ export class IdentityModule {
 
     const options = await generateAuthenticationOptions({
       rpID: config.webauthn.rpId,
-      // Pass the raw 32 hash bytes, NOT the base64url string.
-      //
-      // generateAuthenticationOptions base64url-encodes whatever challenge it
-      // is handed. Given the already-encoded intent hash it encodes it again,
-      // so the authenticator signs base64url(base64url(hash)) while
-      // verifyAuthenticationResponse expects base64url(hash) — every payment
-      // then fails with SIG_INVALID for a reason that looks nothing like an
-      // encoding bug. Handing over the raw bytes makes the challenge the
-      // browser sees byte-identical to transactions.intent_hash.
-      challenge: Buffer.from(intentHash, 'base64url'),
+      // Raw 32 hash bytes, never the base64url string — see the note above.
+      challenge: isoBase64URL.toBuffer(intentHash, 'base64url'),
       allowCredentials: creds.map((c) => ({
         id: Buffer.from(c.id, 'base64url'),
         type: 'public-key' as const,

@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { defaultLimiter, strictLimiter } from './middleware/rateLimiter';
 import { requireSession, issueSession, clearSession } from './middleware/session';
-import { fail, PrismError } from './errors';
+import { fail, PrismError, FAILURES, FailureCode } from './errors';
 import { query } from '../db/pool';
 import { AccountRow, TransactionRow, UserRow, formatMinor } from '../db/types';
 import { identity } from '../modules/identity/webauthn';
@@ -216,7 +216,24 @@ router.post(
     // 1. Ownership and state.
     if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
     if (tx.status === 'SETTLED') fail('REPLAY_BLOCKED');
-    if (tx.status === 'BLOCKED' || tx.status === 'EXPIRED') fail(tx.failure_code as 'RISK_BLOCKED');
+    if (tx.status === 'BLOCKED' || tx.status === 'EXPIRED') {
+      // Re-hitting a transaction that already failed terminally. Return the
+      // code it failed with — but only if it is a real catalogue entry, so a
+      // missing/unknown failure_code degrades to a sane code instead of
+      // throwing a 500 out of fail().
+      const code: FailureCode =
+        tx.failure_code && tx.failure_code in FAILURES
+          ? (tx.failure_code as FailureCode)
+          : tx.status === 'EXPIRED'
+            ? 'INTENT_EXPIRED'
+            : 'RISK_BLOCKED';
+      await audit.log('PAYMENT_BLOCKED', {
+        transactionId: tx.id,
+        userId: req.userId,
+        data: { failureCode: code, terminal: true },
+      });
+      fail(code);
+    }
 
     // 2. Expiry.
     if (intentLock.isExpired(tx)) {
@@ -241,14 +258,33 @@ router.post(
     }
     if (nonceState === null) fail('INTENT_EXPIRED', { reason: 'nonce window closed' });
 
-    // 4. Tamper — recompute the hash from the database and compare.
+    // 4. Tamper — the client must be authorizing the exact locked record.
+    // Amount and payee are inside the intent hash, so a captured assertion
+    // already cannot be replayed against altered details (the signed bytes
+    // differ). We additionally reject outright when the request body carries an
+    // amount, payee, or hash that disagrees with the locked transaction, so a
+    // swap attempt fails as TAMPER_BLOCKED here rather than as a downstream
+    // SIG_INVALID. verifyHash recomputes the hash from the DB columns and
+    // timing-safe compares.
+    const bodyAmount =
+      req.body.amountMinor !== undefined && req.body.amountMinor !== null
+        ? Number(req.body.amountMinor)
+        : undefined;
+    const bodyPayee =
+      req.body.payeeAccountId !== undefined && req.body.payeeAccountId !== null
+        ? String(req.body.payeeAccountId)
+        : undefined;
     const claimedHash = String(req.body.intentHash ?? tx.intent_hash);
-    if (!intentLock.verifyHash(tx, claimedHash)) {
+    const tampered =
+      (bodyAmount !== undefined && bodyAmount !== parseInt(tx.amount_minor, 10)) ||
+      (bodyPayee !== undefined && bodyPayee !== tx.payee_account_id) ||
+      !intentLock.verifyHash(tx, claimedHash);
+    if (tampered) {
       await intentLock.markFailed(tx.id, 'TAMPER_BLOCKED', 'BLOCKED');
       await audit.log('PAYMENT_BLOCKED', {
         transactionId: tx.id,
         userId: req.userId,
-        data: { failureCode: 'TAMPER_BLOCKED', claimedHash },
+        data: { failureCode: 'TAMPER_BLOCKED', claimedHash, bodyAmount, bodyPayee },
       });
       fail('TAMPER_BLOCKED');
     }

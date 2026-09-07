@@ -34,6 +34,11 @@ export const FAILURES = {
   INSUFFICIENT_FUNDS: [402, 'Insufficient balance.'],
   INVALID_AMOUNT: [400, 'Invalid amount.'],
   NOT_FOUND: [404, 'Not found.'],
+  // Emitted by the rate limiter and the global error handler respectively.
+  // Listed here so FailureCode is complete and all three consumers can switch
+  // on the same vocabulary.
+  RATE_LIMITED: [429, 'Too many requests. Please slow down.'],
+  INTERNAL_ERROR: [500, 'Internal server error.'],
 } as const;
 
 export type FailureCode = keyof typeof FAILURES;
