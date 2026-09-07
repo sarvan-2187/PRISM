@@ -37,9 +37,11 @@ import Scan from '@/pages/Scan';
 import Profile from '@/pages/Profile';
 import Settings from '@/pages/Settings';
 import Policy from '@/pages/Policy';
+import AttackDashboard from '@/pages/attacks/Dashboard';
+import AttackDetail from '@/pages/attacks/AttackDetail';
 
 /** Views that get the wide column. Everything else is the focused flow. */
-const WIDE = ['/home', '/settings', '/policy'];
+const WIDE = ['/home', '/profile', '/policy', '/attacks'];
 
 const NAV = [
   { to: '/home', label: 'Home' },
@@ -49,6 +51,7 @@ const NAV = [
   { to: '/profile', label: 'Passkeys' },
   { to: '/settings', label: 'Settings' },
   { to: '/policy', label: 'Policy' },
+  { to: '/attacks', label: 'Attack Sim' },
 ];
 
 /** Inner routes need a session. While it is being fetched, render nothing. */
@@ -67,7 +70,7 @@ function Shell() {
   const { pathname } = useLocation();
   const { me, signOut } = useSession();
 
-  const wide = WIDE.includes(pathname);
+  const wide = WIDE.includes(pathname) || pathname.startsWith('/attacks');
   // The landing hero runs edge to edge and under the header, so on that one
   // route the shell stops constraining and the header stops painting.
   const bleed = pathname === '/';
@@ -188,8 +191,6 @@ function Shell() {
           <Route path="/pay/:txId/timeline" element={guard(<Timeline />)} />
           <Route path="/receive" element={guard(<Receive />)} />
           <Route path="/scan" element={guard(<Scan />)} />
-          <Route path="/settings" element={guard(<Settings />)} />
-          <Route path="/profile" element={<Navigate to="/settings" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
 

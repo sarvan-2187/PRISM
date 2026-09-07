@@ -9,8 +9,9 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { KeyRound, QrCode, RefreshCw } from 'lucide-react';
+import { KeyRound, QrCode, RefreshCw, Radiation } from 'lucide-react';
 import { api, ApiError, TransactionView } from '@/lib/api-client';
+import { demoSessionRevealEnabled, revealMySession } from '@/lib/demoSessionApi';
 import { useSession } from '@/lib/session';
 import { relativeTime } from '@/lib/format';
 import { statusBadge, STATUS_LABEL } from '@/lib/events';
@@ -33,6 +34,27 @@ export default function Home() {
   const [history, setHistory] = useState<TransactionView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
+  const [labEnabled, setLabEnabled] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+
+  useEffect(() => {
+    void demoSessionRevealEnabled().then(setLabEnabled);
+  }, []);
+
+  const copySessionForLab = useCallback(async () => {
+    setCopyStatus('idle');
+    const cookie = await revealMySession();
+    if (!cookie) {
+      setCopyStatus('error');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(cookie);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('error');
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setReloading(true);
@@ -222,6 +244,33 @@ export default function Home() {
               </Button>
             </CardContent>
           </Card>
+
+          {labEnabled && (
+            <Card className="border-warning-mark">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-body-lg">
+                  <Radiation className="size-4 text-destructive" aria-hidden="true" />
+                  Attack Lab demo
+                </CardTitle>
+                <CardDescription>
+                  Copies THIS device's real session cookie to the clipboard so an operator can paste it
+                  into the Live Attack Lab on another device — a real stolen-cookie demonstration against
+                  this real session. Demo-only; disabled in production.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-2">
+                <Button variant="secondary" block onClick={copySessionForLab}>
+                  Copy session for Attack Lab
+                </Button>
+                {copyStatus === 'copied' && (
+                  <span className="text-caption text-success">Copied. Paste it into the Attack Lab's victim-session field.</span>
+                )}
+                {copyStatus === 'error' && (
+                  <span className="text-caption text-destructive">Could not copy — make sure you're signed in.</span>
+                )}
+              </CardContent>
+            </Card>
+          )}
         </aside>
       </div>
     </div>

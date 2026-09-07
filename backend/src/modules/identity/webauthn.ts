@@ -75,7 +75,7 @@ export class IdentityModule {
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge,
-      expectedOrigin: config.webauthn.expectedOrigin,
+      expectedOrigin: config.webauthn.expectedOrigins,
       expectedRPID: config.webauthn.rpId,
       requireUserVerification: true,
     });
@@ -213,7 +213,7 @@ export class IdentityModule {
       verification = await verifyAuthenticationResponse({
         response,
         expectedChallenge,
-        expectedOrigin: config.webauthn.expectedOrigin,
+        expectedOrigin: config.webauthn.expectedOrigins,
         expectedRPID: config.webauthn.rpId,
         requireUserVerification: true,
         authenticator: {
