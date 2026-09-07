@@ -149,13 +149,21 @@ export class IntentLockModule {
     await redis.set(nonceKey(nonce), 'CONSUMED', 'EX', policy.nonceTtlSeconds);
   }
 
-  /** Record a terminal refusal against the transaction. */
+  /**
+   * Record a terminal refusal against the transaction.
+   *
+   * Guarded so a refusal can never overwrite an already-terminal state. The
+   * unguarded version could flip a SETTLED transaction to BLOCKED while the
+   * ledger entries and the moved balances stayed exactly where they were —
+   * a settled payment that reads as refused, with the money gone. `settle()`
+   * holds a row lock; this write did not, so the two could interleave.
+   */
   async markFailed(txId: string, failureCode: string, status: 'BLOCKED' | 'EXPIRED'): Promise<void> {
-    await query('UPDATE transactions SET status = $2, failure_code = $3 WHERE id = $1', [
-      txId,
-      status,
-      failureCode,
-    ]);
+    await query(
+      `UPDATE transactions SET status = $2, failure_code = $3
+        WHERE id = $1 AND status <> 'SETTLED'`,
+      [txId, status, failureCode]
+    );
   }
 }
 

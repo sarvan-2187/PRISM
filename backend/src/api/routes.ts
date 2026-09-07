@@ -29,6 +29,28 @@ async function userByEmail(email: string): Promise<UserRow> {
   return rows[0];
 }
 
+/**
+ * Guard on binding a new passkey to an account.
+ *
+ * The FIRST passkey may be enrolled unauthenticated — there is nothing yet to
+ * prove possession of, and the seeded demo users start with none. Every
+ * SUBSEQUENT passkey requires an authenticated session, which can only have
+ * been obtained by asserting with a passkey the account already holds.
+ *
+ * Without this, naming a known email was enough: /auth/register/verify looked
+ * the user up, bound an attacker-controlled authenticator to them, and handed
+ * back a session cookie. `excludeCredentials` does not close it — that is an
+ * authenticator-side UX hint, not a server-side deny.
+ */
+async function assertMayEnrol(user: UserRow, req: Request): Promise<void> {
+  const existing = await identity.credentialsFor(user.id);
+  if (existing.length === 0) return; // bootstrap: first passkey for this account
+  if (req.userId === user.id) return; // possession of an existing passkey already proven
+  fail('AUTH_FAILED', {
+    reason: 'this account already has a passkey; sign in before enrolling another',
+  });
+}
+
 async function accountFor(userId: string): Promise<AccountRow> {
   const { rows } = await query<AccountRow>(
     'SELECT * FROM accounts WHERE user_id = $1 ORDER BY created_at LIMIT 1',
@@ -70,6 +92,7 @@ router.post(
   strictLimiter,
   wrap(async (req, res) => {
     const user = await userByEmail(String(req.body.email ?? ''));
+    await assertMayEnrol(user, req);
     res.json(await identity.registrationOptions(user));
   })
 );
@@ -79,6 +102,7 @@ router.post(
   strictLimiter,
   wrap(async (req, res) => {
     const user = await userByEmail(String(req.body.email ?? ''));
+    await assertMayEnrol(user, req);
     await identity.verifyRegistration(user.id, req.body.response);
     await issueSession(res, user.id);
     res.json({ ok: true, userId: user.id, displayName: user.display_name });
@@ -374,8 +398,21 @@ router.post(
     if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
     if (intentLock.isExpired(tx)) fail('INTENT_EXPIRED');
 
+    // Only a transaction the risk engine actually sent to step-up may be
+    // answered. markFailed does not clear the Redis step-up record, so without
+    // this check a still-live challenge could be answered on a BLOCKED
+    // transaction to walk it back to PENDING and re-authorize it.
+    if (tx.status !== 'STEP_UP_REQUIRED') {
+      fail('STEP_UP_FAILED', { reason: 'no step-up is pending for this transaction' });
+    }
+
     await semantic.verify(tx, String(req.body.answer ?? ''));
-    await query(`UPDATE transactions SET status = 'PENDING' WHERE id = $1`, [tx.id]);
+    // Guarded so a concurrent block cannot be undone by this write.
+    await query(
+      `UPDATE transactions SET status = 'PENDING'
+        WHERE id = $1 AND status = 'STEP_UP_REQUIRED'`,
+      [tx.id]
+    );
 
     res.json({ ok: true, next: 'REAUTHORIZE' });
   })

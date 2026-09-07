@@ -484,8 +484,12 @@ async function cleanup(): Promise<void> {
 async function main(): Promise<void> {
   console.log('payment.e2e.ts — end-to-end payment correctness\n');
   await preflight();
-  await setup();
+  // setup() is INSIDE the try: it inserts a credential and registers it for
+  // cleanup before it does anything that can fail. Left outside, a setup
+  // failure (a rate-limited login, say) skipped cleanup entirely and leaked a
+  // live passkey onto the demo account every time.
   try {
+    await setup();
     await scenarioA();
     await scenarioB();
     await scenarioC();
