@@ -147,6 +147,24 @@ router.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * Dev-only shortcut: issue a session for a seeded account without a WebAuthn
+ * ceremony. For a laptop demo where the browser has no passkey but the attack
+ * scripts and the Timeline both need to be "signed in as Asha". Refused
+ * outright when NODE_ENV=production — a shipped build has no way in but a
+ * passkey.
+ */
+router.post(
+  '/auth/dev-login',
+  wrap(async (req, res) => {
+    if (process.env.NODE_ENV === 'production') fail('NOT_FOUND');
+    const user = await userByEmail(String(req.body.email ?? ''));
+    await issueSession(res, user.id);
+    await audit.log('LOGIN_SUCCEEDED', { userId: user.id, data: { devLogin: true } });
+    res.json({ ok: true, userId: user.id, displayName: user.display_name, devLogin: true });
+  })
+);
+
 router.get(
   '/me',
   requireSession,
