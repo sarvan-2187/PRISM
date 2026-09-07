@@ -13,9 +13,21 @@ export type TransactionStatus =
   | 'AUTHORIZED'
   | 'SETTLED'
   | 'BLOCKED'
-  | 'EXPIRED';
+  | 'EXPIRED'
+  | 'SUPERSEDED' // replaced by an amendment (002)
+  | 'DURESS_HELD'; // settled to quarantine under duress (002)
 
 export type LedgerDirection = 'DEBIT' | 'CREDIT';
+
+/** Ordered authorization stages (002). */
+export type AuthorizationStage =
+  | 'INTENT_LOCKED'
+  | 'WEBAUTHN_APPROVED'
+  | 'CONTEXT_VERIFIED'
+  | 'POLICY_EVALUATED'
+  | 'RISK_APPROVED'
+  | 'SEMANTIC_VERIFIED'
+  | 'SETTLEMENT_AUTHORIZED';
 
 export interface UserRow {
   id: string;
@@ -30,6 +42,7 @@ export interface AccountRow {
   display_name: string;
   handle: string;
   balance_minor: string; // BIGINT
+  opening_balance_minor: string; // BIGINT (002): balance = opening + net(ledger)
   is_external: boolean;
   created_at: Date;
 }
@@ -45,6 +58,7 @@ export interface CredentialRow {
   created_at: Date;
   last_used_at: Date | null;
   revoked_at: Date | null;
+  is_duress: boolean; // (002) signing with this credential raises duress
 }
 
 export interface TransactionRow {
@@ -64,6 +78,49 @@ export interface TransactionRow {
   risk_reasons: string[];
   failure_code: string | null;
   settled_at: Date | null;
+  amended_from: string | null; // (002) this tx supersedes that one
+  risk_decision: string | null; // (002) APPROVE | STEP_UP | BLOCK, durable
+  fired_rule_ids: string[] | null; // (002) machine ids, not prose
+  policy_version: number | null; // (002) which policy ruleset decided
+}
+
+/** authorization_steps row (002). */
+export interface AuthorizationStepRow {
+  id: string;
+  transaction_id: string;
+  attempt: number;
+  seq: number;
+  stage: AuthorizationStage;
+  payload: Record<string, unknown>;
+  prev_hash: string;
+  row_hash: string;
+  mac: string;
+  recorded_at: Date;
+}
+
+/** settlement_capabilities row (002). */
+export interface SettlementCapabilityRow {
+  id: string;
+  transaction_id: string;
+  attempt: number;
+  intent_hash: string;
+  chain_tip_hash: string;
+  required_stages: string[];
+  mode: 'NORMAL' | 'DURESS';
+  mac: string;
+  issued_at: Date;
+  expires_at: Date;
+  consumed_at: Date | null;
+}
+
+/** duress_alerts row (002). */
+export interface DuressAlertRow {
+  id: string;
+  transaction_id: string;
+  user_id: string;
+  raised_at: Date;
+  released_at: Date | null;
+  release_note: string | null;
 }
 
 export interface LedgerEntryRow {

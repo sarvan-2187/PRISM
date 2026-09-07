@@ -30,6 +30,10 @@ import {
 const DEMO_USERS = [
   { email: 'asha@prism.demo', name: 'Asha Menon' },
   { email: 'priya@prism.demo', name: 'Priya Sharma' },
+  { email: 'sanjay@prism.demo', name: 'Sanjay' },
+  { email: 'rohith@prism.demo', name: 'Rohith' },
+  { email: 'sarvan@prism.demo', name: 'Sarvan' },
+  { email: 'chetan@prism.demo', name: 'Chetan' },
 ];
 
 /** The four things PRISM checks together. Each maps to real backend code. */

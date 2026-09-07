@@ -12,7 +12,10 @@
 import pool, { query } from './pool';
 
 async function reset() {
-  await query('TRUNCATE ledger_entries, audit_logs, transactions, credentials, accounts, users CASCADE');
+  await query(
+    `TRUNCATE settlement_capabilities, authorization_steps, duress_alerts,
+              ledger_entries, audit_logs, transactions, credentials, accounts, users CASCADE`
+  );
   console.log('[Reset] Cleared transactions, ledger, audit, passkeys and accounts.');
   console.log('[Reset] Now run: npm run db:seed');
   await pool.end();

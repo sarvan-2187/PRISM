@@ -39,6 +39,12 @@ export const FAILURES = {
   // on the same vocabulary.
   RATE_LIMITED: [429, 'Too many requests. Please slow down.'],
   INTERNAL_ERROR: [500, 'Internal server error.'],
+  // Proof-carrying authorization (002). Every one is a fail-closed refusal:
+  // the authorization chain could not be verified, so settlement does not run.
+  CHAIN_INVALID: [403, 'The authorization record for this payment is not valid.'],
+  CHAIN_INCOMPLETE: [403, 'A required authorization step is missing.'],
+  CAPABILITY_INVALID: [403, 'The settlement authorization is not valid or has expired.'],
+  POLICY_DENIED: [403, 'A payment policy refused this transaction.'],
 } as const;
 
 export type FailureCode = keyof typeof FAILURES;

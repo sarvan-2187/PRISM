@@ -32,7 +32,15 @@ export type AuditEvent =
   | 'QR_REDEEMED'
   | 'PAYMENT_SETTLED'
   | 'PAYMENT_BLOCKED'
-  | 'CREDENTIAL_REVOKED';
+  | 'CREDENTIAL_REVOKED'
+  // Proof-carrying authorization (002)
+  | 'CHAIN_STEP_RECORDED'
+  | 'SETTLEMENT_AUTHORIZED'
+  | 'CHAIN_VERIFICATION_FAILED'
+  | 'POLICY_DENIED'
+  | 'DURESS_TRIGGERED'
+  | 'DURESS_RELEASED'
+  | 'INTENT_AMENDED';
 
 export class AuditModule {
   async log(

@@ -32,6 +32,61 @@ import { config } from '../../config/env';
 
 const sessionSecret = new TextEncoder().encode(config.jwtSecret);
 
+// ── Attestation keys ──────────────────────────────────────────────────
+//
+// Three purpose-specific keys derived from one root by HKDF. Deriving with
+// distinct `info` strings is not key reuse: the outputs are independent, and a
+// value MAC'd for one purpose can never verify as another. That domain
+// separation is the point — without it an authorization receipt and a QR token
+// signed by the same key are mutually confusable.
+//
+// PRISM_ATTESTATION_ROOT is preferred. Falling back to JWT_SECRET keeps an
+// existing dev environment working without a new variable; it is sound because
+// JWT_SECRET is already required and high-entropy, and HKDF separates the
+// purposes. It is announced at boot so nobody mistakes it for a deployment.
+const HKDF_SALT = Buffer.from('prism/attestation/v1');
+
+function deriveKey(info: string, length = 32): Buffer {
+  const root = Buffer.from(config.attestationRoot ?? config.jwtSecret, 'utf8');
+  return Buffer.from(crypto.hkdfSync('sha256', root, HKDF_SALT, Buffer.from(info), length));
+}
+
+const attestKey = deriveKey('prism/attest/v1');
+const capabilityKey = deriveKey('prism/capability/v1');
+
+if (!config.attestationRoot) {
+  console.warn(
+    '[Keys] PRISM_ATTESTATION_ROOT not set — deriving attestation keys from JWT_SECRET.\n' +
+      '[Keys] Sound (HKDF, separate info strings) but it ties two lifetimes together. Set it for a real deployment.'
+  );
+}
+
+/**
+ * The Ed25519 receipt key, derived deterministically from the same root.
+ *
+ * Deliberately NOT generated at boot the way the QR key is: an ephemeral key
+ * makes every receipt unverifiable after a restart, which defeats the entire
+ * point of handing someone a receipt they can check offline. Deriving it means
+ * it survives restarts with no key file to manage, and the public half is
+ * stable enough to publish.
+ */
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+function loadReceiptKeys(): { privateKey: crypto.KeyObject; publicKey: crypto.KeyObject; kid: string } {
+  const seed = deriveKey('prism/receipt/v1', 32);
+  const privateKey = crypto.createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const publicKey = crypto.createPublicKey(privateKey);
+  const spki = publicKey.export({ format: 'der', type: 'spki' });
+  const kid = 'rcpt-' + crypto.createHash('sha256').update(spki).digest('hex').slice(0, 12);
+  return { privateKey, publicKey, kid };
+}
+
+const receiptKeys = loadReceiptKeys();
+
 interface QrKeys {
   privateKey: KeyLike;
   publicKey: KeyLike;
@@ -112,6 +167,62 @@ export class KeyManagementModule {
   /** Exposed so the QR module can stamp the current kid into its payload. */
   async currentKid(): Promise<string> {
     return (await qrKeys()).kid;
+  }
+
+  // ── Authorization attestation ───────────────────────────────────────
+
+  /**
+   * MAC an authorization-chain step. HMAC, not a signature, because the
+   * verifier and the signer are the same process — asymmetry would buy nothing
+   * and cost a key-distribution problem. What it does buy: an attacker who can
+   * write to the database but cannot read the key still cannot forge a step.
+   */
+  macStep(rowHash: string): string {
+    return crypto.createHmac('sha256', attestKey).update(rowHash, 'utf8').digest('base64url');
+  }
+
+  /** MAC a settlement capability. Separate key, so a step MAC can never pass as one. */
+  macCapability(canonical: string): string {
+    return crypto.createHmac('sha256', capabilityKey).update(canonical, 'utf8').digest('base64url');
+  }
+
+  /**
+   * Constant-time MAC comparison. A plain !== leaks how much of the MAC
+   * matched, which is enough to forge one byte at a time.
+   */
+  macMatches(a: string, b: string): boolean {
+    const bufA = Buffer.from(a, 'utf8');
+    const bufB = Buffer.from(b, 'utf8');
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+  }
+
+  /** Sign an authorization receipt. Ed25519, so anyone can verify without a secret. */
+  signReceipt(canonical: string): string {
+    return crypto.sign(null, Buffer.from(canonical, 'utf8'), receiptKeys.privateKey).toString('base64url');
+  }
+
+  /** Verify a receipt with the public half — the same check a third party runs. */
+  verifyReceipt(canonical: string, signature: string): boolean {
+    try {
+      return crypto.verify(
+        null,
+        Buffer.from(canonical, 'utf8'),
+        receiptKeys.publicKey,
+        Buffer.from(signature, 'base64url')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** The published receipt key, as a JWK plus a PEM for offline verifiers. */
+  receiptPublicKey(): { kid: string; jwk: crypto.JsonWebKey; pem: string } {
+    return {
+      kid: receiptKeys.kid,
+      jwk: receiptKeys.publicKey.export({ format: 'jwk' }),
+      pem: receiptKeys.publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+    };
   }
 }
 

@@ -23,6 +23,7 @@ import { query } from '../../db/pool';
 import pool from '../../db/pool';
 import redis from '../../utils/redis';
 import { config } from '../../config/env';
+import { policy } from '../../config/policy';
 import { createSoftCredential, SoftCredential } from '../identity/softAuthenticator';
 
 const BASE = `http://localhost:${config.port}`;
@@ -104,6 +105,20 @@ async function preflight(): Promise<void> {
 }
 
 async function setup(): Promise<void> {
+  // TEST-ONLY: clear this host's rate-limit counters.
+  //
+  // strictLimiter allows 20 requests per 5 minutes across /auth/*, and each run
+  // of this harness spends 4 of them. Running it repeatedly — which is exactly
+  // what you do while developing — exhausts the budget and every scenario then
+  // fails at login with RATE_LIMITED. The limiter is doing its job; the harness
+  // is the abusive client. Clearing only our own rl:* keys keeps the control
+  // fully armed for real traffic and makes the suite deterministic.
+  const rlKeys = await redis.keys('rl:*');
+  if (rlKeys.length) {
+    await redis.del(...rlKeys);
+    console.log(`  setup: cleared ${rlKeys.length} rate-limit counters (test-only)`);
+  }
+
   const u = await query<{ id: string }>('SELECT id FROM users WHERE email = $1', [ASHA_EMAIL]);
   assert.ok(u.rows[0], `seed missing — no user ${ASHA_EMAIL}. Run npm run db:seed.`);
   ashaUserId = u.rows[0].id;
@@ -152,6 +167,20 @@ async function initiate(): Promise<{ txId: string; intentHash: string }> {
   return { txId: r.body.txId, intentHash: r.body.intentHash };
 }
 
+/**
+ * Spend long enough on the (notional) review screen that the server's own
+ * deliberation measurement does not read as hasty.
+ *
+ * Deliberation is measured server-side from the INTENT_LOCKED audit row, not
+ * from anything the client asserts, so a script that initiates and authorizes
+ * in the same millisecond genuinely looks reflexive and HASTY_APPROVAL fires.
+ * That is the control working, not a test defect — so the harness waits the
+ * way a human would.
+ */
+async function deliberate(): Promise<void> {
+  await new Promise((r) => setTimeout(r, policy.hastyApprovalMs + 400));
+}
+
 async function ledgerCount(txIds: string[]): Promise<number> {
   const r = await query<{ c: string }>(
     'SELECT COUNT(*)::text AS c FROM ledger_entries WHERE transaction_id = ANY($1)',
@@ -169,13 +198,14 @@ async function scenarioA(): Promise<void> {
   assert.equal(view.body.intentHash, intentHash, 'A: server intent hash');
   assert.equal(view.body.status, 'PENDING', 'A: initial status');
 
+  await deliberate();
+
   const ch = await apiCall('POST', `/payment/${txId}/challenge`);
   assert.equal(ch.status, 200, `A: challenge ${JSON.stringify(ch.body)}`);
   assert.equal(ch.body.challenge, intentHash, 'A: options.challenge IS the intent hash (the fix)');
 
   const auth = await apiCall('POST', `/payment/${txId}/authorize`, {
     assertion: cred.sign(ch.body.challenge),
-    deliberationMs: 5000,
   });
   assert.equal(auth.status, 200, `A: authorize ${JSON.stringify(auth.body)}`);
   assert.equal(auth.body.decision, 'APPROVED', `A: decision ${JSON.stringify(auth.body)}`);
@@ -233,7 +263,6 @@ async function scenarioB(): Promise<void> {
 
   const b1 = await apiCall('POST', `/payment/${txId}/authorize`, {
     assertion: cred.sign('x'.repeat(43)),
-    deliberationMs: 5000,
   });
   expectFail(b1, 409, 'REPLAY_BLOCKED', 'B1 (status SETTLED)');
 
@@ -243,7 +272,6 @@ async function scenarioB(): Promise<void> {
   assert.equal(reCh.status, 200, `B2: challenge ${JSON.stringify(reCh.body)}`);
   const b2 = await apiCall('POST', `/payment/${txId}/authorize`, {
     assertion: cred.sign(reCh.body.challenge),
-    deliberationMs: 5000,
   });
   expectFail(b2, 409, 'REPLAY_BLOCKED', 'B2 (nonce CONSUMED)');
 
@@ -264,7 +292,7 @@ async function scenarioB(): Promise<void> {
 // ── Scenario C — expiry (1.4) ─────────────────────────────────────────
 async function scenarioC(): Promise<void> {
   const a = await initiate();
-  await query(`UPDATE transactions SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, [a.txId]);
+  await query(`UPDATE transactions SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, [a.txId]);
   const cCh = await apiCall('POST', `/payment/${a.txId}/challenge`);
   expectFail(cCh, 410, 'INTENT_EXPIRED', 'C (challenge path)');
   const cRow = await query<{ status: string }>('SELECT status FROM transactions WHERE id = $1', [a.txId]);
@@ -273,10 +301,9 @@ async function scenarioC(): Promise<void> {
   const b = await initiate();
   const bCh = await apiCall('POST', `/payment/${b.txId}/challenge`);
   assert.equal(bCh.status, 200, 'C: challenge issued while valid');
-  await query(`UPDATE transactions SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, [b.txId]);
+  await query(`UPDATE transactions SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, [b.txId]);
   const bAuth = await apiCall('POST', `/payment/${b.txId}/authorize`, {
     assertion: cred.sign(bCh.body.challenge),
-    deliberationMs: 5000,
   });
   expectFail(bAuth, 410, 'INTENT_EXPIRED', 'C (authorize path)');
   const bRow = await query<{ status: string; failure_code: string | null }>(
@@ -299,7 +326,6 @@ async function scenarioD(): Promise<void> {
   const dAmount = await apiCall('POST', `/payment/${a.txId}/authorize`, {
     assertion: aAssertion,
     amountMinor: 5_000_000, // "resubmit with a bigger amount"
-    deliberationMs: 5000,
   });
   expectFail(dAmount, 403, 'TAMPER_BLOCKED', 'D (amount swap)');
 
@@ -327,7 +353,6 @@ async function scenarioD(): Promise<void> {
   const dHash = await apiCall('POST', `/payment/${b.txId}/authorize`, {
     assertion: cred.sign(bCh.body.challenge),
     intentHash: wrongHash,
-    deliberationMs: 5000,
   });
   expectFail(dHash, 403, 'TAMPER_BLOCKED', 'D (hash claim mismatch)');
 
@@ -394,7 +419,6 @@ async function scenarioE(): Promise<void> {
     await query(`UPDATE credentials SET revoked_at = NOW() WHERE id = $1`, [eCred.credentialId]);
     const bAuth = await apiCall('POST', `/payment/${b.txId}/authorize`, {
       assertion: bAssertion,
-      deliberationMs: 5000,
     });
     expectFail(bAuth, 401, 'AUTH_FAILED', 'E (authorize with revoked credential)');
 
@@ -425,6 +449,9 @@ async function cleanup(): Promise<void> {
       );
       await query('DELETE FROM ledger_entries WHERE transaction_id = ANY($1)', [createdTxIds]);
       await query('DELETE FROM audit_logs WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM settlement_capabilities WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM duress_alerts WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM authorization_steps WHERE transaction_id = ANY($1)', [createdTxIds]);
       await query('DELETE FROM transactions WHERE id = ANY($1)', [createdTxIds]);
       for (const { nonce } of nonces.rows) await redis.del(`nonce:${nonce}`);
       for (const id of createdTxIds) await redis.del(`challenge:auth:${id}`);
@@ -460,8 +487,12 @@ async function cleanup(): Promise<void> {
 async function main(): Promise<void> {
   console.log('payment.e2e.ts — end-to-end payment correctness\n');
   await preflight();
-  await setup();
+  // setup() is INSIDE the try: it inserts a credential and registers it for
+  // cleanup before it does anything that can fail. Left outside, a setup
+  // failure (a rate-limited login, say) skipped cleanup entirely and leaked a
+  // live passkey onto the demo account every time.
   try {
+    await setup();
     await scenarioA();
     await scenarioB();
     await scenarioC();
