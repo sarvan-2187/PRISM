@@ -48,7 +48,10 @@ export interface AppendResult {
 export interface ChainVerification {
   ok: boolean;
   tipHash: string;
+  /** Stages recorded in the target attempt — the authorization that is settling now. */
   stagesPresent: AuthorizationStage[];
+  /** Stages recorded anywhere up to the target attempt (e.g. SEMANTIC_VERIFIED from an earlier retry). */
+  stagesEver: AuthorizationStage[];
   reason?: string;
 }
 
@@ -190,13 +193,20 @@ export class AttestationChainModule {
       )
     ).rows;
 
-    const bad = (reason: string): ChainVerification => ({ ok: false, tipHash: '', stagesPresent: [], reason });
+    const bad = (reason: string): ChainVerification => ({
+      ok: false,
+      tipHash: '',
+      stagesPresent: [],
+      stagesEver: [],
+      reason,
+    });
     if (rows.length === 0) return bad('no chain');
 
     let expectedPrev = intentHash;
     let lastAttempt = 0;
     let lastSeq = -1;
     const stagesInTargetAttempt: AuthorizationStage[] = [];
+    const stagesEver: AuthorizationStage[] = [];
 
     for (const row of rows) {
       if (row.attempt === lastAttempt) {
@@ -228,10 +238,16 @@ export class AttestationChainModule {
       expectedPrev = row.row_hash;
       lastAttempt = row.attempt;
       lastSeq = row.seq;
+      stagesEver.push(row.stage);
       if (row.attempt === attempt) stagesInTargetAttempt.push(row.stage);
     }
 
-    return { ok: true, tipHash: expectedPrev, stagesPresent: stagesInTargetAttempt };
+    return {
+      ok: true,
+      tipHash: expectedPrev,
+      stagesPresent: stagesInTargetAttempt,
+      stagesEver,
+    };
   }
 
   /**
@@ -250,7 +266,15 @@ export class AttestationChainModule {
     const chain = await this.verify(transactionId, attempt, intentHash);
     if (!chain.ok) fail('CHAIN_INVALID', { reason: chain.reason });
 
-    const missing = requiredStages.filter((s) => !chain.stagesPresent.includes(s));
+    // SEMANTIC_VERIFIED may have been recorded in an earlier attempt (the user
+    // confirmed the change, then re-authorized) — a completed step-up does not
+    // expire per attempt. Every other stage must be in the attempt that is
+    // settling now.
+    const missing = requiredStages.filter((s) =>
+      s === 'SEMANTIC_VERIFIED'
+        ? !chain.stagesEver.includes(s)
+        : !chain.stagesPresent.includes(s)
+    );
     if (missing.length > 0) {
       fail('CHAIN_INCOMPLETE', { reason: `missing mandatory stages: ${missing.join(', ')}`, missing });
     }
@@ -336,6 +360,29 @@ export class AttestationChainModule {
     if (tip.stage === 'INTENT_LOCKED' && tip.seq === 0) return tip.attempt; // fresh, unused
     const r = await this.append(transactionId, 'INTENT_LOCKED', { reattempt: true });
     return r.attempt;
+  }
+
+  /**
+   * Whether a given stage has been recorded — for one attempt, or anywhere for
+   * the transaction when `attempt` is null.
+   */
+  async hasStage(
+    transactionId: string,
+    attempt: number | null,
+    stage: AuthorizationStage
+  ): Promise<boolean> {
+    const { rows } =
+      attempt === null
+        ? await query(
+            `SELECT 1 FROM authorization_steps WHERE transaction_id = $1 AND stage = $2 LIMIT 1`,
+            [transactionId, stage]
+          )
+        : await query(
+            `SELECT 1 FROM authorization_steps
+              WHERE transaction_id = $1 AND attempt = $2 AND stage = $3 LIMIT 1`,
+            [transactionId, attempt, stage]
+          );
+    return rows.length > 0;
   }
 
   /** Highest attempt number recorded for a transaction (0 if none). */

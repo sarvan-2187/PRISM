@@ -26,15 +26,25 @@
  * and clarity at the decisive moment; it is not a cure.
  */
 import redis from '../../utils/redis';
+import { query } from '../../db/pool';
 import { policy } from '../../config/policy';
 import { audit } from '../audit/logger';
 import { fail } from '../../api/errors';
 import { intentLock } from '../intent/intentLock';
+import { hashesMatch } from '../../utils/canonical';
 import { TransactionRow, formatMinor } from '../../db/types';
+
+export interface IntentChange {
+  field: string;
+  from: string;
+  to: string;
+}
 
 interface StepUpRecord {
   expected: string;
   intentHash: string;
+  /** 'digits' = last two digits of the amount; 'amount' = the full new amount in rupees. */
+  kind: 'digits' | 'amount';
 }
 
 const challengeKey = (txId: string) => `stepup:${txId}`;
@@ -47,6 +57,8 @@ export interface StepUpChallenge {
   amountFormatted: string;
   expiresInSeconds: number;
   attemptsRemaining: number;
+  /** Populated when this transaction supersedes an earlier one. */
+  changes?: IntentChange[];
 }
 
 export class SemanticModule {
@@ -68,23 +80,57 @@ export class SemanticModule {
     }
 
     const amountMinor = parseInt(tx.amount_minor, 10);
-    const expected = String(Math.floor(amountMinor / 100) % 100).padStart(2, '0');
 
-    const record: StepUpRecord = { expected, intentHash: tx.intent_hash };
+    // When the transaction supersedes an earlier one, ask the user to confirm
+    // the CHANGE — "type the new amount" — not a generic digit quiz. This is the
+    // control that answers "the amount changed from ₹5,000 to ₹50,000; did you
+    // mean that?" and it demands the user read and re-enter the real figure.
+    let kind: StepUpRecord['kind'] = 'digits';
+    let expected = String(Math.floor(amountMinor / 100) % 100).padStart(2, '0');
+    let prompt = 'Enter the last two digits of the amount you intend to send.';
+    let changes: IntentChange[] | undefined;
+
+    if (tx.amended_from) {
+      const prior = (
+        await query<{ amount_minor: string; currency: string; payee_account_id: string }>(
+          `SELECT amount_minor, currency, payee_account_id FROM transactions WHERE id = $1`,
+          [tx.amended_from]
+        )
+      ).rows[0];
+      if (prior) {
+        changes = [];
+        if (prior.amount_minor !== tx.amount_minor) {
+          changes.push({
+            field: 'amount',
+            from: formatMinor(prior.amount_minor, prior.currency),
+            to: formatMinor(tx.amount_minor, tx.currency),
+          });
+        }
+        if (prior.payee_account_id !== tx.payee_account_id) {
+          changes.push({ field: 'recipient', from: 'the original recipient', to: payeeName });
+        }
+        kind = 'amount';
+        expected = String(Math.floor(amountMinor / 100)); // full rupees, no paise
+        prompt = `This payment changed. Type the new amount in rupees (${expected}) to confirm.`;
+      }
+    }
+
+    const record: StepUpRecord = { expected, intentHash: tx.intent_hash, kind };
     await redis.set(challengeKey(tx.id), JSON.stringify(record), 'EX', policy.stepUp.ttlSeconds);
 
     await audit.log('STEP_UP_ISSUED', {
       transactionId: tx.id,
       userId: tx.payer_user_id,
-      data: { attemptsUsed: used },
+      data: { attemptsUsed: used, kind },
     });
 
     return {
       payeeName,
       amountFormatted: formatMinor(tx.amount_minor, tx.currency),
-      prompt: 'Enter the last two digits of the amount you intend to send.',
+      prompt,
       expiresInSeconds: policy.stepUp.ttlSeconds,
       attemptsRemaining: policy.stepUp.maxAttempts - used,
+      changes,
     };
   }
 
@@ -111,7 +157,7 @@ export class SemanticModule {
       fail('TAMPER_BLOCKED', { reason: 'challenge bound to a different intent' });
     }
 
-    if (answer.trim() !== record.expected) {
+    if (!hashesMatch(answer.trim(), record.expected)) {
       // INCR is atomic, so two concurrent wrong answers cannot both read the
       // same count and spend one attempt between them.
       const used = await redis.incr(attemptsKey(tx.id));

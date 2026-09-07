@@ -10,6 +10,7 @@
  * constraint on (transaction_id, direction). That is enforced by the database,
  * not by the code path above it.
  */
+import crypto from 'crypto';
 import { getClient, query } from '../../db/pool';
 import { SettlementCapabilityRow, TransactionRow } from '../../db/types';
 import { audit } from '../audit/logger';
@@ -93,7 +94,11 @@ export class SettlementModule {
       if (chain.tipHash !== cap.chain_tip_hash) {
         fail('CHAIN_INVALID', { reason: 'chain tip moved since the capability was minted' });
       }
-      const missing = cap.required_stages.filter((s) => !chain.stagesPresent.includes(s as never));
+      const missing = cap.required_stages.filter((s) =>
+        s === 'SEMANTIC_VERIFIED'
+          ? !chain.stagesEver.includes(s as never)
+          : !chain.stagesPresent.includes(s as never)
+      );
       if (missing.length > 0) {
         fail('CHAIN_INCOMPLETE', { reason: `missing: ${missing.join(', ')}`, missing });
       }
@@ -163,6 +168,80 @@ export class SettlementModule {
       if ((err as { code?: string }).code === '23505') {
         fail('REPLAY_BLOCKED', { reason: 'settlement already recorded' });
       }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Move a duress-held payment out of quarantine. `forward` = on to the original
+   * payee; otherwise back to the payer. Recorded as its own settled transaction
+   * (quarantine -> destination) so the ledger stays append-only and every
+   * account still reconciles.
+   */
+  async releaseDuress(
+    tx: TransactionRow,
+    forward: boolean
+  ): Promise<{ releaseTxId: string; destination: string }> {
+    const amount = parseInt(tx.amount_minor, 10);
+    const qId = await quarantineAccount();
+    const destId = forward ? tx.payee_account_id : tx.payer_account_id;
+
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: cur } = await client.query<{ status: string }>(
+        'SELECT status FROM transactions WHERE id = $1 FOR UPDATE',
+        [tx.id]
+      );
+      if (cur[0]?.status !== 'DURESS_HELD') {
+        throw new PrismError(409, 'REPLAY_BLOCKED', 'This payment has already been released.');
+      }
+
+      const [a, b] = [qId, destId].sort();
+      await client.query('SELECT id FROM accounts WHERE id IN ($1,$2) ORDER BY id FOR UPDATE', [a, b]);
+
+      const releaseTxId = crypto.randomUUID();
+      const nonce = crypto.randomBytes(32).toString('hex');
+      await client.query(
+        `INSERT INTO transactions
+           (id, payer_user_id, payer_account_id, payee_account_id, amount_minor, currency,
+            intent_hash, nonce, lock_version, created_at, expires_at, status, settled_at, amended_from)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1, NOW(), NOW(), 'SETTLED', NOW(), $9)`,
+        [
+          releaseTxId,
+          tx.payer_user_id,
+          qId,
+          destId,
+          amount,
+          tx.currency,
+          `release:${releaseTxId}`,
+          `release:${nonce}`,
+          tx.id,
+        ]
+      );
+      await client.query('UPDATE accounts SET balance_minor = balance_minor - $2 WHERE id = $1', [qId, amount]);
+      await client.query('UPDATE accounts SET balance_minor = balance_minor + $2 WHERE id = $1', [destId, amount]);
+      await client.query(
+        `INSERT INTO ledger_entries (transaction_id, account_id, direction, amount_minor)
+         VALUES ($1,$2,'DEBIT',$4), ($1,$3,'CREDIT',$4)`,
+        [releaseTxId, qId, destId, amount]
+      );
+      await client.query(
+        `UPDATE transactions SET status = 'SETTLED', settled_at = NOW() WHERE id = $1`,
+        [tx.id]
+      );
+      await client.query(
+        `UPDATE duress_alerts SET released_at = NOW(), release_note = $2 WHERE transaction_id = $1`,
+        [tx.id, forward ? 'forwarded to payee' : 'refunded to payer']
+      );
+
+      await client.query('COMMIT');
+      return { releaseTxId, destination: forward ? 'payee' : 'payer' };
+    } catch (err) {
+      await client.query('ROLLBACK');
       throw err;
     } finally {
       client.release();

@@ -195,6 +195,15 @@ export class IntentLockModule {
       [txId, status, failureCode]
     );
   }
+
+  /** Retire a transaction that an amendment has replaced. Never touches a settled one. */
+  async markSuperseded(txId: string): Promise<void> {
+    await query(
+      `UPDATE transactions SET status = 'SUPERSEDED'
+        WHERE id = $1 AND status IN ('PENDING', 'STEP_UP_REQUIRED')`,
+      [txId]
+    );
+  }
 }
 
 export const intentLock = new IntentLockModule();

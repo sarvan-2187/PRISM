@@ -68,7 +68,7 @@ export class IdentityModule {
     return options;
   }
 
-  async verifyRegistration(userId: string, response: RegistrationResponseJSON): Promise<void> {
+  async verifyRegistration(userId: string, response: RegistrationResponseJSON): Promise<string> {
     const expectedChallenge = await redis.get(regChallengeKey(userId));
     if (!expectedChallenge) fail('AUTH_FAILED', { reason: 'registration challenge expired' });
 
@@ -105,6 +105,21 @@ export class IdentityModule {
 
     await redis.del(regChallengeKey(userId));
     await audit.log('PASSKEY_REGISTERED', { userId, data: { credentialDeviceType } });
+
+    return Buffer.from(credentialID).toString('base64url');
+  }
+
+  /**
+   * Mark a credential as a duress passkey. Signing a payment with it is
+   * indistinguishable to anyone watching — the WebAuthn prompt is identical —
+   * but the server routes the payment to quarantine and raises an alert.
+   */
+  async markDuress(userId: string, credentialId: string): Promise<void> {
+    const { rowCount } = await query(
+      `UPDATE credentials SET is_duress = TRUE WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+      [credentialId, userId]
+    );
+    if (!rowCount) throw new PrismError(404, 'NOT_FOUND', 'No such active credential.');
   }
 
   // ── Login (session establishment, not payment approval) ───────────────
