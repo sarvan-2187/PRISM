@@ -47,4 +47,9 @@ export const config = {
   // absent, KeyManagementModule generates an ephemeral keypair at boot, which
   // is fine for a demo and explicitly not how this would run in production.
   qrSigningKeyPem: process.env.QR_SIGNING_KEY || null,
+  // Root secret for the authorization-chain MAC keys and the Ed25519 receipt
+  // key, all derived from it by HKDF with separate info strings. Optional: when
+  // absent it falls back to JWT_SECRET (sound — HKDF separates the purposes —
+  // but it ties two key lifetimes together, so set it for a real deployment).
+  attestationRoot: process.env.PRISM_ATTESTATION_ROOT || null,
 } as const;
