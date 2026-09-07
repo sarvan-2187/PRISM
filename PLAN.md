@@ -337,107 +337,154 @@ POST /payment/:id/authorize   { assertion }
 
 ## 4. Team Responsibility Matrix
 
-Four agents, one repository. **File ownership is the mechanism that prevents overwrites** — not politeness, not coordination chatter.
+**Revised at M0.** The original allocation put the whole backend on one agent. That was right while the schema, the canonical-hash contract and the authorize pipeline were being pinned down — those are genuinely serial, and splitting them would have produced four incompatible hash implementations. That work is finished, so the balance changes:
 
-| Path | Owner | Others |
+**Three agents on backend, one on frontend.** S1–S3 are Claude Code agents; S4 is Anti Gravity Pro and owns the frontend end to end.
+
+### The honest consequence: the frontend is now the critical path
+
+The backend is roughly 90% written and **0% end-to-end tested**. The frontend is one working sign-in screen and five stubs. So the risk has inverted: three agents polishing a backend that has no interface to demonstrate it would be the worst possible use of the remaining hours.
+
+Two mitigations, both deliberate:
+
+1. **S3's work produces judge-facing evidence without the React app.** Attack scripts that print request → response → audit row are a scored criterion in their own right (Rules §2.F, "attack-then-defend demonstration"). If the UI slips, the security story still lands.
+2. **S1 and S2 are capped.** Once the pipeline settles a payment and the risk engine is tuned, they stop adding backend features and move to supporting S4 — reviewing API shapes, writing fixtures, and taking frontend tasks S4 delegates. **Backend feature freeze is 20:30**, the same deadline as Future-Card readiness.
+
+### Ownership
+
+| Agent | Role | Owns (sole editor) |
 |---|---|---|
-| `backend/src/modules/**` | **S1** | read-only |
-| `backend/src/db/**`, `config/**`, `utils/**` | **S1** | read-only |
-| `backend/src/api/**` | **S1** | request changes |
-| `frontend/src/pages/**`, `lib/**` | **S2** | read-only |
-| `frontend/src/components/flow/**` | **S2** | read-only |
-| `attacks/**` | **S3** | read-only |
-| `backend/src/**/*.test.ts`, `scripts/smoke.mjs` | **S3** | read-only |
-| `frontend/src/components/ui/**`, `styles/**` | **S4** | read-only |
-| `frontend/src/pages/Landing.tsx`, `Timeline.tsx`, `Receipt.tsx` | **S4** | read-only |
-| `README.md`, `docs/**` | **S4** | request changes |
-| `docker-compose.yml`, `.env.example` | **S4** | request changes |
+| **S1** · Claude | Core payment correctness | `modules/identity/**`, `modules/intent/**`, `modules/ledger/**`, `db/**`, `api/routes.ts`, `api/middleware/**`, `api/errors.ts` |
+| **S2** · Claude | Risk · context · semantic · QR | `modules/context/**`, `modules/risk/**`, `modules/semantic/**`, `modules/qr/**`, `modules/keys/**`, `config/policy.ts` |
+| **S3** · Claude | Adversarial + verification + docs | `attacks/**`, `scripts/**`, `docs/**`, `README.md` |
+| **S4** · Anti Gravity | Entire frontend | `frontend/**` — every file |
 
-**Hot shared files** — `routes.ts`, `api-client.ts`, `db/types.ts`, `policy.ts`. Rule: only the owner edits; anyone else opens a one-line request in the team channel. `api-client.ts` is owned by S2 but its **shape is dictated by S1's routes** — agree it in writing at hour 2 and treat it as frozen.
+Nobody edits another agent's tree. Ask the owner; they make the change.
 
-S4 is deliberately given real product surface (landing, security timeline, receipt, the whole design system) plus infra and docs — **not** documentation alone. From hour 12 S4 is the Future Card implementation lead, because S4 is the only member without a critical-path dependency at that point.
+### Collision points and the rules that prevent them
+
+| File | Owner | Rule |
+|---|---|---|
+| `api/routes.ts` | **S1** | S2 changes a module's behaviour, never its wiring. Need a new route or a changed response? Post the shape to S1 and let S1 wire it. This is the single most likely merge conflict in the repo. |
+| `config/policy.ts` | **S2** | S1 and S3 read it freely. Only S2 changes thresholds and TTLs, so tuning has one source of truth. |
+| `db/migrations/**` | **S1** | Append-only. `001` is applied; never edit it. New columns go in `002_*.sql`. |
+| `docs/api-contract.md` | **S3** | Frozen. It changes only after S1 has actually changed a route — the document follows the code, never leads it. |
+| `frontend/src/lib/api-client.ts` | **S4** | Its shape is dictated by S1's routes. S1 announces route changes; S4 applies them. |
+
+### What is already built (do not rewrite it)
+
+| Component | State |
+|---|---|
+| Schema, migrations, seed with 20 synthetic payments | ✅ working |
+| Canonical intent hash + pinned self-check (`npm test`) | ✅ working — **treat as frozen** |
+| Passkey registration, login, httpOnly session cookie | ✅ working |
+| Intent lock, nonce state machine, append-only audit | ✅ working |
+| Context · risk · semantic · Ed25519 QR · atomic ledger | ⚠️ written, never run end to end |
+| Authorize pipeline wiring (`routes.ts`) | ⚠️ written, never run end to end |
+| Frontend: Vite scaffold, api-client, webauthn-client, sign-in | ✅ working |
+| Frontend: Pay · Review · Verify · Status · Timeline | ⛔ stubs |
+| Attack scripts, smoke harness | ⛔ not started |
+
+The gap between ✅ and ⚠️ is the whole job now. **Written is not working.**
 
 ---
 
 ## 5. Detailed Task Breakdown
 
-Complexity: **S** ≈ <45min · **M** ≈ 1–2h · **L** ≈ 2–4h. Priority: **P0** = demo fails without it.
+Complexity: **S** ≈ <45min · **M** ≈ 1–2h · **L** ≈ 2–4h. **P0** = the demo fails without it.
 
-### M0 — Unblock (hour 2–3) · everyone, in parallel
+### S1 — Core payment correctness
 
-| Task | Owner | Pri | Cx | Depends | Done when | Files | ∥ |
-|---|---|---|---|---|---|---|---|
-| Start Docker Desktop; `compose up postgres redis -d` | S4 | P0 | S | — | `docker ps` shows both healthy | — | ✓ |
-| `npm install` both workspaces | S1,S2 | P0 | S | — | no install errors | `package.json` | ✓ |
-| Rewrite migration 001 + implement `migrate.ts` | S1 | P0 | M | Docker | `npm run db:migrate` creates 6 tables | `db/migrations/001`, `db/migrate.ts` | ✗ |
-| `seed.ts`: Asha, Priya, 2 known payees, 1 external, balances, ~20 synthetic past txns | S1 | P0 | S | migrate | risk baselines have history | `db/seed.ts` | ✗ |
-| Delete Next.js app, scaffold Vite + React 18 + React Router | S2 | P0 | M | npm i | `npm run dev` serves a routed blank app | whole `frontend/` | ✓ |
-| Fix `keyManager` jose import; Ed25519 keypair + session HMAC | S1 | P0 | S | npm i | `tsc` clean; sign/verify round-trips | `modules/keys/keyManager.ts` | ✓ |
-| `policy.ts` — all tunables centralised | S1 | P0 | S | — | no magic numbers elsewhere | `config/policy.ts` | ✓ |
-| `canonical.ts` + **self-check asserting a known vector** | S1 | P0 | S | — | `node --test` passes | `utils/canonical.ts` | ✓ |
-| Agree API contract in writing | all | P0 | S | — | `docs/api-contract.md` merged | `docs/` | ✗ |
+The most valuable hour anyone spends today is the first one here: nothing else can be trusted until a payment actually settles.
 
-### M1 — Payment settles end to end (hour 3–8) · **critical path**
+| # | Task | Pri | Cx | Done when |
+|---|---|---|---|---|
+| 1.1 | **Settle one payment end to end by hand** — register, initiate, challenge, approve, settle | **P0** | M | `accounts.balance_minor` changes and `transactions.status = 'SETTLED'` |
+| 1.2 | Fix whatever 1.1 breaks — expect the WebAuthn challenge encoding to be first | **P0** | L | assertion verifies against `intent_hash` unmodified |
+| 1.3 | Verify replay: authorize the same transaction twice | **P0** | S | second attempt returns `409 REPLAY_BLOCKED` |
+| 1.4 | Verify expiry: wait 95s, then authorize | **P0** | S | `410 INTENT_EXPIRED`, distinct from replay |
+| 1.5 | Verify tamper: recompute path with an altered amount | **P0** | M | `403 TAMPER_BLOCKED` |
+| 1.6 | Confirm the timeline endpoint records every branch | P0 | S | `/transactions/:id/timeline` shows the full chain |
+| 1.7 | Publish the route list to S4 the moment it stops moving | P0 | S | S4 confirms `api-client.ts` matches |
+| 1.8 | Credential revocation end to end | P2 | S | revoked passkey returns `AUTH_FAILED` |
 
-| Task | Owner | Pri | Cx | Depends | Done when | ∥ |
-|---|---|---|---|---|---|---|
-| Session cookie middleware | S1 | P0 | S | keyManager | `userId` never read from a body | ✓ |
-| Passkey register + login | S1 | P0 | L | session | credential row persists; login sets cookie | ✗ |
-| Intent lock + `GET /payment/:id` | S1 | P0 | M | canonical, migrate | hash stable across restarts | ✗ |
-| Challenge = intent hash; assertion verify | S1 | P0 | L | identity, intent | **assertion verifies against the hash** | ✗ |
-| Audit logger + timeline endpoint | S1 | P0 | S | migrate | every branch writes a row | ✓ |
-| Ledger settlement | S1 | P0 | M | intent | balances move; second attempt rejected | ✗ |
-| Register/login UI | S2 | P0 | M | contract | passkey registers in Chrome | ✓ |
-| Payment composer (payee + amount) | S2 | P0 | M | contract | posts initiate, receives txId | ✓ |
-| Review screen, **server-authoritative** + countdown | S2 | P0 | M | `GET /payment/:id` | renders **only** server values | ✓ |
-| Passkey prompt + authorize | S2 | P0 | M | above | happy path completes in browser | ✗ |
-| `scripts/smoke.mjs` end-to-end assertion | S3 | P0 | M | routes | one command proves the pipeline | ✓ |
-| Design tokens, layout shell, receipt | S4 | P1 | M | Vite | consistent, readable, dark-safe | ✓ |
-| Security timeline UI | S4 | P0 | M | timeline endpoint | shows every decision + reason | ✓ |
+**Hand-off:** the instant 1.1–1.5 pass, tell S3. Their attack scripts assert on exactly those codes.
 
-### M2 — Security layer (hour 8–14)
+### S2 — Risk, context, semantic, QR
 
-| Task | Owner | Pri | Cx | Depends | ∥ |
-|---|---|---|---|---|---|
-| Context module (device/session-weighted) | S1 | P0 | M | M1 | ✓ |
-| Risk engine + rule array + reasons | S1 | P0 | M | context | ✗ |
-| Semantic step-up (last two digits, 3 attempts, rate-limited) | S1 | P0 | M | risk | ✗ |
-| Ed25519 QR issue + redeem | S1 | P0 | M | keyManager | ✓ |
-| Rate limiting tightened per route | S1 | P1 | S | — | ✓ |
-| Credential revocation endpoint | S1 | P2 | S | identity | ✓ |
-| Step-up UI + failure-code screens | S2 | P0 | M | semantic | ✓ |
-| QR display + link redemption page | S2 | P1 | M | QR | ✓ |
-| **Attack 1 tamper · 2 replay · 3 QR swap · 4 expiry** | S3 | P0 | L | M2 | ✓ |
-| `PRISM_DISABLE` control toggle (dev-only) | S3+S1 | P1 | S | policy | ✓ |
-| Threat model doc mapping attack→control→code | S3 | P1 | M | — | ✓ |
-| README: approach, **AI disclosure**, run steps | S4 | P0 | M | — | ✓ |
+Every one of these is written and none has ever executed. The job is to make them *fire correctly*, not to add signals.
 
-### M3 — Future Card (from draw time) · S4 leads, S1 supports, S2 UI, S3 re-tests
+| # | Task | Pri | Cx | Done when |
+|---|---|---|---|---|
+| 2.1 | Run the risk engine against seeded history; check the scores are sane | **P0** | M | a normal ₹500 payment to Priya scores APPROVE |
+| 2.2 | **Tune thresholds so a second browser profile lands on STEP_UP, not BLOCK** | **P0** | M | new profile + new payee + ₹48,000 → `202 STEP_UP` |
+| 2.3 | Semantic step-up loop: issue → answer → re-authorize → settle | **P0** | L | correct two digits leads to settlement |
+| 2.4 | Attempt cap and rate limit on the two-digit answer | **P0** | S | 3 wrong answers exhaust it; 4th is refused |
+| 2.5 | QR issue → redeem round trip | P1 | M | valid token returns server-authoritative details |
+| 2.6 | QR negatives: unsigned, expired, re-scanned | P1 | M | three distinct failure codes |
+| 2.7 | Confirm `PRISM_DISABLE` actually weakens each control | P1 | S | S3 can demo the "before" state |
+| 2.8 | Context baseline updates only after a clean settlement | P2 | S | second payment from the same profile scores lower |
 
-### M4 — Freeze, rehearse, submit (hour 21–24)
+**Do not add risk signals.** Six rules are enough. Extra signals are Future Card budget.
 
-Regression via `smoke.mjs` + all attacks · three full demo rehearsals · screenshots · architecture diagram · final README · repo public and cloned-fresh verified.
+### S3 — Adversarial, verification, documentation
 
-### Critical path, bottlenecks, deferrals
+This produces the attack-then-defend evidence, which is scored on its own and does not depend on the React app.
 
-- **Critical path (S1, ~9h serial):** migration → canonical hash → identity → intent lock → hash-as-challenge → authorize pipeline → ledger. This is one person's serial work and **cannot be parallelised** — the explainer says so and it is correct. S1 must not be given anything else.
-- **Parallel from hour 2:** S2 frontend against the contract, S3 smoke/attack harness against stubs, S4 design system + docs + infra.
-- **Integration bottlenecks:** (i) API contract at hour 2 — if it slips, S2 and S3 build against nothing; (ii) hour 8 first-integration; (iii) the WebAuthn challenge encoding, the single likeliest multi-hour sink.
-- **Must precede reviews:** faculty → happy path settles; night → tamper + replay blocked live; jury → all four attacks + Future Card.
-- **Deferrable without mercy:** camera scanning, revocation UI, animations, mobile layout, `PRISM_DISABLE`, extra risk signals.
+| # | Task | Pri | Cx | Done when |
+|---|---|---|---|---|
+| 3.1 | `scripts/smoke.mjs` — full happy path, exits non-zero on failure | **P0** | M | one command proves the pipeline |
+| 3.2 | Attack 1 — **amount tampering** | **P0** | M | prints request, `TAMPER_BLOCKED`, audit row |
+| 3.3 | Attack 2 — **replay** ×10 | **P0** | M | all ten refused; three defence layers named |
+| 3.4 | Attack 3 — **QR swap** (unsigned + valid-for-another-tx) | **P0** | M | `QR_INVALID_SIGNATURE`; second shows the real payee |
+| 3.5 | Attack 4 — **expired intent** | **P0** | S | `INTENT_EXPIRED` |
+| 3.6 | Attack 5 — **recipient swap** | P1 | S | `TAMPER_BLOCKED` |
+| 3.7 | Attack 6 — **semantic brute force** | P1 | S | exhausts at 3, then rate-limited |
+| 3.8 | **Closing query**: no money moved, every attempt logged | **P0** | S | one SQL statement proves the invariant |
+| 3.9 | `docs/threat-model.md` — attack → control → file → failure code | P1 | M | every claim points at real code |
+| 3.10 | Rewrite `README.md` below the ⚠️ marker | **P0** | M | matches what shipped; **AI disclosure included** |
+| 3.11 | Architecture diagram reflecting what was built, not the deck | P1 | M | in `docs/` |
+
+**Rules §2.D:** every attack targets our own localhost instance. Never the event network, never another team.
+
+### S4 — Frontend (Anti Gravity Pro)
+
+Sole owner of `frontend/**`. `Landing.tsx` is complete and is the reference pattern — copy its `api.*` + `ApiError` + `failureCode` shape rather than inventing another.
+
+| # | Task | Pri | Cx | Done when |
+|---|---|---|---|---|
+| 4.1 | **`Pay.tsx`** — payee list, amount in ₹ → paise, initiate | **P0** | M | navigates to `/pay/:txId` |
+| 4.2 | **`Review.tsx`** — details **only** from `api.payment(txId)`, live countdown | **P0** | L | renders nothing carried from the composer |
+| 4.3 | **`Review.tsx`** — challenge → passkey → authorize, record `deliberationMs` | **P0** | L | happy path settles in the browser |
+| 4.4 | **`Status.tsx`** — receipt, or failure code + risk reasons | **P0** | M | unknown codes fall back, never crash |
+| 4.5 | **`Verify.tsx`** — step-up: real payee, real amount, two digits | **P0** | M | passing it returns to re-authorize |
+| 4.6 | **`Timeline.tsx`** — the audit trail, readable rows not raw JSON | **P0** | M | every attack becomes self-evidencing |
+| 4.7 | QR display + link redemption | P1 | M | 60s countdown, refresh on expiry |
+| 4.8 | Visual polish, empty and loading states | P2 | M | **after** 4.1–4.6, never before |
+
+**4.2 is the security-critical screen.** Every value comes from the server. That one rule is what defeats QR tampering, and a judge will ask about it by name.
+
+**Escalate early.** If 4.1–4.4 will not land by 18:00, say so — S1 and S2 are freed at 20:30 and can take 4.5–4.7, but only if asked in time.
 
 ---
 
 ## 6. Critical Path
 
 ```
-Docker+deps ─> migration ─> canonical hash ─> identity ─> intent lock
-     ─> hash-as-challenge ─> authorize pipeline ─> ledger ─> SETTLED
-                                    │
-     (parallel, non-blocking) ──────┼── S2 UI ── S3 attacks ── S4 design/docs
+S1: settle one payment  ──┐
+                          ├─> S3 attacks  ──> evidence for judging
+S2: risk tuned + step-up ─┘
+                          └─> S4 Pay -> Review -> Status -> Timeline  ──> demo
 ```
 
-**Hour-10 abort rule**, taken directly from the explainer: *"If no payment settles end to end by hour 10, scope is cut immediately rather than pushed forward."* First cuts, in order: QR module → semantic step-up → context/risk (fall back to fixed thresholds on amount + new-payee only). Never cut: intent lock, hash-as-challenge, replay defence, ledger.
+**The frontend is the long pole.** S1 and S2 are each roughly 3–4 hours from done; S4 has six screens. Two consequences:
+
+- **20:30 backend feature freeze.** After it, S1 and S2 write no new backend code. They support S4, fix regressions, and stand ready for the Future Card.
+- **The 18:00 checkpoint is a real decision point.** If no payment has settled in a browser by then, cut in this order: QR screens → step-up UI → polish. Never cut the review screen: without it there is no MVP.
+
+**Hour-10 abort rule stands** (from the explainer): if no payment settles end to end by hour 10, scope is cut immediately rather than pushed forward.
+
+**Never cut:** intent lock · hash-as-challenge · replay defence · atomic ledger · the review screen.
 
 ---
 
@@ -485,9 +532,9 @@ Repo: `https://github.com/sarvan-2187/PRISM` (already remote, `main` only). Trun
 4. **`main` must always run.** If a merge breaks it, revert first and fix on a branch. Never leave `main` broken while debugging.
 5. **Never force-push `main`. Never squash or rebase away commit timestamps** — the timestamps are our proof that all code was written inside the event window (Rules §2.C).
 
-**Merge order at integration points:** S1 schema/contract → S1 modules → S2 UI → S3 tests → S4 polish. Polish never merges ahead of the thing it polishes.
+**Merge order at integration points:** S1 routes/schema → S2 modules → S3 tests and attacks → S4 frontend. A route change merges before the screen that consumes it, and polish never merges ahead of the thing it polishes.
 
-**Conflict prevention:** ownership table (§4) is the primary mechanism; migrations are append-only after hour 3; `.env` is never committed (`.env.example` is, and S4 owns it).
+**Conflict prevention:** the ownership table (§4) is the primary mechanism — four disjoint trees, one editor each. Migrations are append-only. `.env` is never committed; `.env.example` is, and S3 owns it. The one file that will genuinely contend is `api/routes.ts`: S1 is its sole editor, and S2 requests wiring rather than doing it.
 
 **Definition of runnable `main`:** `docker compose up postgres redis -d && npm run db:migrate && npm run db:seed && npm run dev` in backend, `npm run dev` in frontend, then `npm run smoke` exits 0.
 
@@ -500,7 +547,7 @@ Repo: `https://github.com/sarvan-2187/PRISM` (already remote, `main` only). Trun
 - **Working:** register passkey, compose payment, review server-authoritative details, approve, settle. Balances change. Timeline shows the decision chain.
 - **Demonstrate:** the happy path, then the tamper attempt if it is ready.
 - **Evidence:** terminal showing `SETTLED`, timeline screenshot, `psql` row from `ledger_entries`.
-- **Explain:** S1 — why the challenge *is* the hash; S2 — why the review screen never renders QR/URL values; S3 — what the smoke test asserts; S4 — the schema and the run instructions.
+- **Explain:** S1 — why the challenge *is* the hash, and why a failed payment never consumes the nonce; S2 — which risk rules fired and why the thresholds sit where they do; S3 — what the smoke test asserts; S4 — why the review screen renders only server values.
 - **Not left unfinished:** a payment that settles. Without it there is no MVP and Phase 1 has failed.
 
 ### Night student-coordinators review 2
@@ -565,11 +612,13 @@ No engine change, no schema change, and the reason string flows to the UI automa
 
 **Adding a new security check** — one function pushed into the authorize chain, returning a `failureCode` or `null`. New codes need no migration: `audit_logs.event_type` is free-form text and `event_data` is `JSONB`.
 
-**Adding a new UI state** — one entry in the failure-code map S2 owns. Unknown codes already fall back to a generic blocked screen, so the UI degrades safely rather than crashing on something it has never seen.
+**Adding a new UI state** — one entry in the failure-code map S4 owns. Unknown codes already fall back to a generic blocked screen, so the UI degrades safely rather than crashing on something it has never seen.
 
 **Avoiding a rewrite:** never inline a threshold; never let the UI decide policy; never read `userId` from a body; keep migrations append-only. If a card demands a genuinely new module, it plugs into the pipeline the same way the seven existing ones do.
 
-**Execution:** S4 leads (no critical-path dependency at hour 12), S1 supports on backend, S2 on UI, S3 re-runs all attacks after. **Timebox 4 hours**; if it will not fit, implement the smallest honest version and document the rest as designed-not-built — the same boundary discipline used everywhere else in this plan.
+**Execution:** **S2 leads** — the risk engine and `policy.ts` are where most cards will land, and S2's own work is feature-frozen at 20:30. S1 takes any schema or pipeline change; S3 re-runs every attack afterwards, because a card that weakens an existing defence must be caught before judging. **S4 joins only for a UI state that a card actually requires** — the frontend is the critical path and must not be pulled off it.
+
+**Timebox 4 hours.** If it will not fit, implement the smallest honest version and document the rest as designed-not-built — the same boundary discipline used everywhere else in this plan.
 
 ---
 
@@ -595,42 +644,35 @@ No engine change, no schema change, and the reason string flows to the UI automa
 
 ---
 
-## 13. First Implementation Milestone
+## 13. Current Milestone
 
-**M0 — Unblock (target: 60 minutes).** Nothing else can start.
+### M0 — complete ✅
 
-**Start order:**
+Verified from a clean state: both workspaces typecheck, the frontend builds, migrations and seed are idempotent, the backend boots with `/health` green, the session guard returns `401 AUTH_FAILED` to anonymous callers, and `npm test` pins the canonical-hash vector.
 
-1. **S4 first, immediately, alone:** start Docker Desktop, `docker compose up postgres redis -d`, verify both healthy. **Everything is blocked behind this.**
-2. **S1 second (critical path):** `npm install`; fix `keyManager.ts`; write `config/policy.ts` and `utils/canonical.ts` with its self-check; rewrite migration `001`; implement `migrate.ts`; write `seed.ts`.
-3. **S2 in parallel:** delete the Next.js app, scaffold Vite + React + React Router, port `api-client.ts`, implement `webauthn-client.ts`.
-4. **S3 in parallel:** `scripts/smoke.mjs` asserting the full happy path against the agreed contract — it will fail until M1, and that failing output is the definition of done for M1.
-5. **All four at hour 2:** agree and merge `docs/api-contract.md` before S2 and S3 write anything that binds to it.
+Seven latent scaffold bugs were fixed on the way through — a non-existent `jose` import, a `pg` generic that blocked every `ts-node` script, a migration runner that applied nothing, a missing seed file, a missing `globals.css`, compose services with no Dockerfiles, and a pool error handler that killed the process. Two design holes were closed: the `accounts` table (settlement had no money to move) and session cookies (every route previously trusted a client-supplied `userId`).
 
-**Files created or rewritten in M0:**
+### M1 — the gate we are now working to
 
-| File | Action |
+**One payment settles end to end in a browser.** Nothing else counts until this does.
+
+| Owner | Must be true |
 |---|---|
-| `backend/src/db/migrations/001_initial_schema.sql` | Rewrite — 6 tables, `amount_minor BIGINT`, `accounts`, unique ledger constraint |
-| `backend/src/db/migrate.ts` | Implement (~10 lines) |
-| `backend/src/db/seed.ts` | New — users, accounts, balances, ~20 synthetic transactions |
-| `backend/src/db/types.ts` | Update to match schema |
-| `backend/src/config/policy.ts` | New — every tunable |
-| `backend/src/utils/canonical.ts` | New — canonical JSON + hash + self-check |
-| `backend/src/modules/keys/keyManager.ts` | Fix jose import; Ed25519 + HMAC |
-| `backend/src/api/middleware/session.ts` | New — cookie JWT |
-| `backend/src/index.ts` | Add `cookie-parser`, `/health`, fix startup await |
-| `frontend/**` | Replace Next.js with Vite + React |
-| `scripts/smoke.mjs` | New — end-to-end assertion |
-| `docs/api-contract.md` | New — frozen at hour 2 |
+| S1 | initiate → challenge → passkey → authorize → `SETTLED`, balances changed |
+| S2 | risk engine returns APPROVE for a normal payment and STEP_UP for a second browser profile |
+| S3 | `npm run smoke` exits 0 against the real server |
+| S4 | `Pay.tsx` → `Review.tsx` → `Status.tsx` complete the flow in Chrome |
 
-**Parallel-safe:** S1 backend · S2 frontend · S3 scripts · S4 infra+docs touch four disjoint trees. Only `docs/api-contract.md` needs all four, and it is written once.
+**Definition of done:** `npm run smoke` registers a passkey, locks an intent, verifies an assertion whose challenge equals the intent hash, settles atomically, and asserts that a second identical authorize returns `409 REPLAY_BLOCKED`.
 
-**Verification for M0:** `docker ps` shows both containers · `npm run db:migrate` creates 6 tables · `npm run db:seed` gives Asha a positive balance · `npx tsc --noEmit` clean in both workspaces · `curl localhost:4000/health` returns 200 · `node --test` passes the canonical-hash vector · frontend dev server serves a routed page.
+### M2 — security layer
 
-**Verification for M1 (the real gate):** `npm run smoke` exits 0, having registered a passkey, locked an intent, verified an assertion whose challenge equals the intent hash, settled atomically, and asserted that a second identical authorize returns `409 REPLAY_BLOCKED`.
+S2 finishes step-up and QR; S3 lands attacks 1–4 with distinct failure codes; S4 adds `Verify.tsx` and `Timeline.tsx`. **Backend feature freeze at 20:30**, which is also Future-Card readiness.
 
-**Awaiting confirmation before starting** — per your execution rules, these are the plan's material architectural changes and I will not begin until you approve: rewriting migration `001` and adding `accounts`; deleting the Next.js frontend; introducing session cookies so `userId` is never body-supplied.
+### The two things most likely to cost hours
+
+1. **The WebAuthn challenge encoding.** One representation, base64url, server-computed, never re-encoded on the way through. `npm test` guards the hash itself; the assertion path is guarded only by S1 actually running it. Do this first.
+2. **Frontend capacity.** Six screens, one agent. The 18:00 checkpoint is the moment to reallocate, not 02:00.
 
 ---
 

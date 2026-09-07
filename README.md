@@ -23,11 +23,84 @@ npm run dev                                # :4000
 cd ../frontend && npm install && npm run dev   # :5173
 ```
 
-Open <http://localhost:5173>, register a passkey as Asha, and pay.
-Health check: `curl localhost:4000/health`.
+Open <http://localhost:5173>. Health check: `curl localhost:4000/health`.
 
 > **Do not change the hostname or port after registering a passkey.** The
-> WebAuthn RP ID is bound to `localhost`, and every credential dies with it.
+> WebAuthn RP ID is bound to `localhost:5173`, and every credential dies with
+> it. Settle this before anyone registers.
+
+---
+
+## Create a passkey (do this first)
+
+PRISM has no passwords. Before you can pay, this device needs a passkey — a
+keypair whose private half stays in the device's secure hardware. PRISM only
+ever stores the public key and only ever sees a signature.
+
+**Register before you sign in.** A fresh browser profile has no passkey, so
+"Sign in" will fail with `AUTH_FAILED: no passkey registered` until you have
+registered once.
+
+### Option A — Windows Hello / Touch ID (what a judge sees)
+
+1. Open <http://localhost:5173> in Chrome or Edge
+2. Leave the account dropdown on **Asha Menon**
+3. Click **Register a passkey on this device**
+4. In the OS dialog choose **This device**
+5. Confirm with your **PIN, fingerprint, or face**
+
+Then click **Sign in**.
+
+> Requires Windows Hello to be set up. PRISM sends
+> `userVerification: 'required'`, so an account with no PIN cannot register.
+> Set one under **Settings → Accounts → Sign-in options → PIN**.
+
+### Option B — Chrome virtual authenticator (use this while building)
+
+No hardware, no OS prompt, and you can create as many distinct "devices" as
+you need — which is how the step-up demo gets a second device on one laptop.
+
+1. **F12** → DevTools **⋮** → **More tools** → **WebAuthn**
+2. Tick **Enable virtual authenticator environment**
+3. **Add** an authenticator: protocol **ctap2**, transport **internal**,
+   **resident keys** ✅, **user verification** ✅
+4. Register in the app — it completes instantly
+
+Registering from a second Chrome profile (or after replacing the virtual
+authenticator) makes the `NEW_DEVICE` and `NO_BASELINE` risk rules fire
+deterministically, which is what drives the step-up demo.
+
+### Option C — phone as passkey
+
+In the OS dialog pick **Use another device**, scan the QR with your phone,
+approve with fingerprint or face. Visually strong for judging, but it needs
+Bluetooth and adds a live failure point — treat it as a bonus, not the
+primary path.
+
+### If registration fails
+
+| Message | Cause |
+|---|---|
+| `InvalidStateError` — already registered | This device already has a passkey for that account. Just **Sign in**. |
+| `NotAllowedError` | Cancelled, or the prompt timed out. |
+| `SecurityError` | Not a secure context. Must be `http://localhost:5173` — not `127.0.0.1`, not a LAN IP. |
+| `AUTH_FAILED: no passkey registered` | You clicked Sign in before Register. |
+
+Confirm a credential landed:
+
+```bash
+docker exec prism-postgres-1 psql -U prism_user -d prism_db \
+  -c "SELECT id, device_type, backed_up, created_at FROM credentials;"
+```
+
+Start over — clears passkeys only, leaving accounts and payment history:
+
+```bash
+docker exec prism-postgres-1 psql -U prism_user -d prism_db \
+  -c "DELETE FROM credentials;"
+```
+
+---
 
 ## Current state (M0 complete)
 
