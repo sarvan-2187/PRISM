@@ -35,10 +35,11 @@ import Timeline from '@/pages/Timeline';
 import Receive from '@/pages/Receive';
 import Scan from '@/pages/Scan';
 import Profile from '@/pages/Profile';
+import Settings from '@/pages/Settings';
 import Policy from '@/pages/Policy';
 
 /** Views that get the wide column. Everything else is the focused flow. */
-const WIDE = ['/home', '/profile', '/policy'];
+const WIDE = ['/home', '/settings', '/policy'];
 
 const NAV = [
   { to: '/home', label: 'Home' },
@@ -46,6 +47,7 @@ const NAV = [
   { to: '/receive', label: 'Receive' },
   { to: '/scan', label: 'Scan' },
   { to: '/profile', label: 'Passkeys' },
+  { to: '/settings', label: 'Settings' },
   { to: '/policy', label: 'Policy' },
 ];
 
@@ -186,8 +188,11 @@ function Shell() {
           <Route path="/pay/:txId/timeline" element={guard(<Timeline />)} />
           <Route path="/receive" element={guard(<Receive />)} />
           <Route path="/scan" element={guard(<Scan />)} />
+          <Route path="/settings" element={guard(<Settings />)} />
+          <Route path="/profile" element={<Navigate to="/settings" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+
       </main>
 
       <footer className="border-t px-6 py-4 text-center text-caption text-muted-foreground">

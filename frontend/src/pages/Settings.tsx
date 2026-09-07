@@ -1,0 +1,552 @@
+/**
+ * Settings — Passkey & Device Management.   OWNER: S4
+ *
+ * Two tabs, one data source:
+ *   Passkeys  — every authenticator on this account, with revoke + add-new.
+ *   Devices   — same credentials as a device table with a "This device" badge.
+ *
+ * "This device" is identified by comparing the credential ID stored in
+ * sessionStorage during login (see Landing.tsx) with each credential row.
+ * No backend change needed: the browser knows which credential it used.
+ *
+ * Revoking is immediate and one-way. The key stays on the lost device;
+ * PRISM simply stops accepting anything it signs.
+ */
+import { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  KeyRound,
+  Fingerprint,
+  RefreshCw,
+  ShieldCheck,
+  MonitorSmartphone,
+  Plus,
+  Laptop,
+} from 'lucide-react';
+import { api, ApiError } from '@/lib/api-client';
+import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
+import { useSession } from '@/lib/session';
+import { relativeTime } from '@/lib/format';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Separator } from '@/components/ui/separator';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface Credential {
+  id: string;
+  deviceType: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+// ── Shared hook ───────────────────────────────────────────────────────────────
+
+function useCreds() {
+  const [creds, setCreds] = useState<Credential[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoadError(null);
+    try {
+      setCreds(await api.credentials());
+    } catch (err) {
+      setLoadError(
+        err instanceof ApiError
+          ? err.message
+          : 'Could not reach PRISM. Check that the backend is running.'
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function revoke(id: string) {
+    setRevoking(id);
+    setActionError(null);
+    try {
+      await api.revoke(id);
+      setConfirming(null);
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? `${err.failureCode}: ${err.message}` : String(err));
+    } finally {
+      setRevoking(null);
+    }
+  }
+
+  return { creds, loadError, confirming, setConfirming, revoking, revoke, actionError, load };
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const ACTIVE_CRED_KEY = 'prism.activeCredential';
+
+function isSynced(deviceType: string) {
+  return deviceType !== 'singleDevice';
+}
+
+function CredIcon({ deviceType, className }: { deviceType: string; className?: string }) {
+  return isSynced(deviceType) ? (
+    <KeyRound className={className} aria-hidden="true" />
+  ) : (
+    <Fingerprint className={className} aria-hidden="true" />
+  );
+}
+
+function deviceLabel(deviceType: string) {
+  return deviceType === 'singleDevice' ? 'This device only' : 'Synced passkey';
+}
+
+function ThisDeviceBadge() {
+  return (
+    <Badge
+      variant="outline"
+      className="border-primary/40 bg-primary/10 text-primary text-caption"
+    >
+      This device
+    </Badge>
+  );
+}
+
+// ── Inline revoke confirm — two clicks, no modal ──────────────────────────────
+
+function RevokeControls({
+  id,
+  confirming,
+  revoking,
+  onConfirm,
+  onRevoke,
+  onCancel,
+}: {
+  id: string;
+  confirming: string | null;
+  revoking: string | null;
+  onConfirm: (id: string) => void;
+  onRevoke: (id: string) => void;
+  onCancel: () => void;
+}) {
+  const isConfirming = confirming === id;
+  const isRevoking = revoking === id;
+
+  if (isConfirming) {
+    return (
+      <div className="flex gap-2">
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={() => onRevoke(id)}
+          disabled={isRevoking}
+        >
+          {isRevoking ? 'Revoking…' : 'Confirm revoke'}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={isRevoking}>
+          Keep it
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <Button variant="secondary" size="sm" onClick={() => onConfirm(id)}>
+      Revoke
+    </Button>
+  );
+}
+
+// ── Add Passkey Button ────────────────────────────────────────────────────────
+
+function AddPasskeyButton({ email, onSuccess }: { email: string; onSuccess: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleAdd() {
+    setBusy(true);
+    setError(null);
+    try {
+      const options = await api.registerOptions(email);
+      const response = await webauthn.register(options);
+      await api.registerVerify(email, response);
+      onSuccess();
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? `${err.failureCode}: ${err.message}`
+          : describeWebAuthnError(err)
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <Button variant="secondary" size="sm" onClick={handleAdd} disabled={busy}>
+        <Plus />
+        {busy ? 'Adding…' : 'Add a passkey on this device'}
+      </Button>
+
+      {error && (
+        <Alert variant="destructive" className="mt-3">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+    </div>
+  );
+}
+
+// ── Empty state ───────────────────────────────────────────────────────────────
+
+function NoPasskeys({ signOut }: { signOut: () => void }) {
+  return (
+    <div className="rounded-lg border border-dashed border-border-strong px-6 py-10 text-center">
+      <h3 className="font-semibold">No active passkeys</h3>
+      <p className="mx-auto mt-2 max-w-[44ch] text-pretty text-small text-secondary-foreground">
+        Every passkey on this account has been revoked. Register a new one from the sign-in screen
+        to use this account again.
+      </p>
+      <Button variant="secondary" className="mt-5" onClick={signOut}>
+        Sign out and register again
+      </Button>
+    </div>
+  );
+}
+
+// ── Tab: Passkeys ─────────────────────────────────────────────────────────────
+
+function PasskeysTab({
+  creds,
+  loadError,
+  confirming,
+  setConfirming,
+  revoking,
+  revoke,
+  actionError,
+  load,
+  email,
+  signOut,
+}: ReturnType<typeof useCreds> & { email: string; signOut: () => void }) {
+  const activeId = sessionStorage.getItem(ACTIVE_CRED_KEY);
+
+  return (
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,340px)] lg:items-start">
+      {/* Main list */}
+      <Card>
+        <CardContent className="pt-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-body-lg font-semibold">Registered authenticators</h2>
+            <Button variant="ghost" size="sm" onClick={load}>
+              <RefreshCw />
+              Refresh
+            </Button>
+          </div>
+
+          {(loadError || actionError) && (
+            <Alert variant="destructive" className="mt-4">
+              <AlertDescription>{loadError ?? actionError}</AlertDescription>
+            </Alert>
+          )}
+
+          {!creds && !loadError && (
+            <div className="mt-5 grid gap-3" aria-busy="true">
+              <Skeleton className="h-3.5 w-[55%]" />
+              <Skeleton className="h-3.5 w-[35%]" />
+              <Skeleton className="mt-2 h-3.5 w-[45%]" />
+              <Skeleton className="h-3.5 w-[30%]" />
+            </div>
+          )}
+
+          {creds?.length === 0 && <NoPasskeys signOut={signOut} />}
+
+          {creds && creds.length > 0 && (
+            <>
+              {creds.map((c, i) => (
+                <div key={c.id}>
+                  {i > 0 && <Separator />}
+                  <div className="flex flex-wrap items-start justify-between gap-4 py-4">
+                    <div className="flex min-w-0 flex-1 basis-60 gap-3">
+                      <CredIcon
+                        deviceType={c.deviceType}
+                        className="mt-0.5 size-4 shrink-0 text-secondary-foreground"
+                      />
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <strong className="font-medium">{deviceLabel(c.deviceType)}</strong>
+                          {c.id === activeId && <ThisDeviceBadge />}
+                        </div>
+                        <p className="mt-1 text-small text-secondary-foreground">
+                          Registered {relativeTime(c.createdAt)} ·{' '}
+                          {c.lastUsedAt
+                            ? `last used ${relativeTime(c.lastUsedAt)}`
+                            : 'never used to approve a payment'}
+                        </p>
+                        <p className="mt-1.5 break-all font-mono text-caption text-muted-foreground">
+                          {c.id.slice(0, 28)}…
+                        </p>
+                      </div>
+                    </div>
+                    <div className="shrink-0">
+                      <RevokeControls
+                        id={c.id}
+                        confirming={confirming}
+                        revoking={revoking}
+                        onConfirm={setConfirming}
+                        onRevoke={revoke}
+                        onCancel={() => setConfirming(null)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+              <p className="mt-2 text-pretty text-small text-secondary-foreground">
+                Revoking is immediate and cannot be undone. The key stays on the lost device; PRISM
+                simply stops accepting anything it signs.
+              </p>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Sidebar */}
+      <aside className="grid gap-5">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-body-lg">
+              <Plus className="size-4 text-primary" aria-hidden="true" />
+              Add this device
+            </CardTitle>
+            <CardDescription>
+              Register a passkey for the device you are on right now. It will appear in this list
+              and can be revoked independently.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AddPasskeyButton email={email} onSuccess={load} />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-body-lg">
+              <ShieldCheck className="size-4 text-primary" aria-hidden="true" />
+              How passkeys protect you
+            </CardTitle>
+            <CardDescription>
+              The private key never leaves the device it was created on. Revoking a passkey is the
+              right response to a lost or stolen device — not a password reset.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild variant="ghost" block>
+              <Link to="/policy">See what PRISM enforces</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </aside>
+    </div>
+  );
+}
+
+// ── Tab: Devices ──────────────────────────────────────────────────────────────
+
+function DevicesTab({
+  creds,
+  loadError,
+  confirming,
+  setConfirming,
+  revoking,
+  revoke,
+  actionError,
+  load,
+  signOut,
+}: ReturnType<typeof useCreds> & { signOut: () => void }) {
+  const activeId = sessionStorage.getItem(ACTIVE_CRED_KEY);
+
+  return (
+    <Card>
+      <CardContent className="pt-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-body-lg font-semibold">Registered devices</h2>
+          <Button variant="ghost" size="sm" onClick={load}>
+            <RefreshCw />
+            Refresh
+          </Button>
+        </div>
+
+        <p className="mt-1 text-small text-secondary-foreground">
+          Each entry is a device that holds a passkey for this account.
+        </p>
+
+        {(loadError || actionError) && (
+          <Alert variant="destructive" className="mt-4">
+            <AlertDescription>{loadError ?? actionError}</AlertDescription>
+          </Alert>
+        )}
+
+        {!creds && !loadError && (
+          <div className="mt-5 grid gap-4" aria-busy="true">
+            {[1, 2].map((n) => (
+              <div key={n} className="flex items-center gap-4">
+                <Skeleton className="size-8 rounded-full" />
+                <div className="flex-1 space-y-2">
+                  <Skeleton className="h-3.5 w-[40%]" />
+                  <Skeleton className="h-3 w-[60%]" />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {creds?.length === 0 && <NoPasskeys signOut={signOut} />}
+
+        {creds && creds.length > 0 && (
+          <div className="mt-5 overflow-x-auto">
+            <table className="w-full text-small">
+              <thead>
+                <tr className="border-b text-left text-secondary-foreground">
+                  <th className="pb-2 pr-4 font-medium">Device</th>
+                  <th className="pb-2 pr-4 font-medium">Added</th>
+                  <th className="pb-2 pr-4 font-medium">Last used</th>
+                  <th className="pb-2 pr-4 font-medium">Status</th>
+                  <th className="pb-2 font-medium">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {creds.map((c) => {
+                  const isThis = c.id === activeId;
+                  return (
+                    <tr key={c.id} className="border-b last:border-0">
+                      <td className="py-3 pr-4">
+                        <div className="flex items-center gap-2">
+                          {isSynced(c.deviceType) ? (
+                            <MonitorSmartphone
+                              className="size-4 shrink-0 text-secondary-foreground"
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <Laptop
+                              className="size-4 shrink-0 text-secondary-foreground"
+                              aria-hidden="true"
+                            />
+                          )}
+                          <div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium">{deviceLabel(c.deviceType)}</span>
+                              {isThis && <ThisDeviceBadge />}
+                            </div>
+                            <p className="mt-0.5 break-all font-mono text-caption text-muted-foreground">
+                              {c.id.slice(0, 20)}…
+                            </p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="py-3 pr-4 text-secondary-foreground">
+                        {relativeTime(c.createdAt)}
+                      </td>
+                      <td className="py-3 pr-4 text-secondary-foreground">
+                        {c.lastUsedAt ? relativeTime(c.lastUsedAt) : '—'}
+                      </td>
+                      <td className="py-3 pr-4">
+                        <Badge
+                          variant="outline"
+                          className="border-success-mark/30 bg-success-mark/10 text-success-mark"
+                        >
+                          Active
+                        </Badge>
+                      </td>
+                      <td className="py-3">
+                        <RevokeControls
+                          id={c.id}
+                          confirming={confirming}
+                          revoking={revoking}
+                          onConfirm={setConfirming}
+                          onRevoke={revoke}
+                          onCancel={() => setConfirming(null)}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <p className="mt-4 text-pretty text-small text-secondary-foreground">
+              Revoking a device is immediate and permanent. The passkey stays on the hardware but
+              PRISM will refuse any signature it produces.
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Page root ─────────────────────────────────────────────────────────────────
+
+export default function Settings() {
+  const { me, signOut } = useSession();
+  const creds = useCreds();
+
+  return (
+    <div className="animate-enter-up">
+      <div className="mb-8">
+        <h1 className="text-h2 font-semibold max-md:text-h3">Settings</h1>
+        <p className="mt-2 max-w-[60ch] text-pretty text-small text-secondary-foreground">
+          Manage the passkeys and devices that can approve payments on this account.
+        </p>
+      </div>
+
+      {/* Account strip */}
+      <Card className="mb-6">
+        <CardContent className="flex flex-wrap items-center justify-between gap-4 py-4">
+          <dl className="flex flex-wrap gap-x-8 gap-y-2 text-small">
+            <div>
+              <dt className="text-secondary-foreground">Name</dt>
+              <dd className="mt-0.5 font-medium">{me?.displayName ?? '—'}</dd>
+            </div>
+            <div>
+              <dt className="text-secondary-foreground">PRISM ID</dt>
+              <dd className="mt-0.5 font-medium">{me?.email ?? '—'}</dd>
+            </div>
+            <div>
+              <dt className="text-secondary-foreground">Balance</dt>
+              <dd className="mt-0.5 font-medium tabular">{me?.balanceFormatted ?? '—'}</dd>
+            </div>
+          </dl>
+          <Button variant="secondary" size="sm" onClick={signOut}>
+            Sign out
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Tabs defaultValue="passkeys">
+        <TabsList className="mb-6">
+          <TabsTrigger value="passkeys">
+            <KeyRound className="size-3.5" />
+            Passkeys
+          </TabsTrigger>
+          <TabsTrigger value="devices">
+            <MonitorSmartphone className="size-3.5" />
+            Devices
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="passkeys">
+          <PasskeysTab {...creds} email={me?.email ?? ''} signOut={signOut} />
+        </TabsContent>
+
+        <TabsContent value="devices">
+          <DevicesTab {...creds} signOut={signOut} />
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}

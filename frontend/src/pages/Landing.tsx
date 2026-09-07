@@ -217,7 +217,10 @@ export default function Landing() {
         const options = await api.loginOptions(email);
         const response = await webauthn.approve(options);
         await api.loginVerify(email, response);
+        // Remember which credential signed in so Settings can show "This device".
+        sessionStorage.setItem('prism.activeCredential', response.id);
       }
+
       await refresh();
       navigate('/home');
     } catch (err) {

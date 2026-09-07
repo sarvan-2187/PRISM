@@ -102,6 +102,96 @@ docker exec prism-postgres-1 psql -U prism_user -d prism_db \
 
 ---
 
+## Access it from another device
+
+The app runs on `localhost` by default. Getting it onto a second laptop or a
+phone takes one extra step, and there is exactly one reason it is not simply
+"use the LAN IP":
+
+**WebAuthn will not work over `http://192.168.x.x:5173`.** A passkey needs a
+secure context (HTTPS or `localhost`), *and* the WebAuthn spec requires the
+RP ID to be a domain name — an IP address is rejected outright. No browser
+flag gets around the second one. So a LAN IP gets you a page your friends can
+look at, and a sign-in button that cannot work.
+
+The fix is one HTTPS tunnel, with Vite proxying the API so the whole app stays
+on a single origin. Same origin means no CORS change and the `sameSite=lax`
+session cookie keeps working.
+
+### One-time setup
+
+```powershell
+winget install --id Cloudflare.cloudflared --accept-source-agreements --accept-package-agreements
+```
+
+`vite.config.ts` is already configured for this: `host: true`, an `allowedHosts`
+list for tunnel domains, and `/api` + `/health` proxied to port 4000. Vite 5.4.12+
+rejects unrecognised `Host` headers with a bare *"Blocked request. This host is
+not allowed."*, which is why the allow-list has to exist.
+
+### Each time
+
+```powershell
+# terminal 1 — dev server bound to all interfaces
+cd s:\prismrontend
+npm run dev -- --host
+
+# terminal 2 — the tunnel (note the leading & : PowerShell needs it to run a quoted path)
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://localhost:5173
+```
+
+cloudflared prints a URL like `https://random-words-here.trycloudflare.com`.
+Put that hostname into `.env`:
+
+```ini
+WEBAUTHN_RP_ID=random-words-here.trycloudflare.com
+WEBAUTHN_EXPECTED_ORIGIN=https://random-words-here.trycloudflare.com
+VITE_API_URL=
+```
+
+`WEBAUTHN_RP_ID` is the **host only** — no scheme, no port. `VITE_API_URL` stays
+empty so the frontend uses relative URLs through the proxy; a value here would
+send visitors' browsers to *their own* machine.
+
+Then **restart the backend**, because config is read once at boot.
+
+### The part that catches people out
+
+**Changing `WEBAUTHN_RP_ID` invalidates every passkey already registered.** A
+passkey is bound to its RP ID, so switching between `localhost` and a tunnel
+host in either direction means everyone re-registers. It takes about five
+seconds per person (the "Register a passkey on this device" button), but it is
+a surprise if you hit it mid-rehearsal. A free quick-tunnel hostname changes on
+every restart, so this recurs each time.
+
+Keep a `localhost` copy of the config so you can switch back in one command:
+
+```powershell
+Copy-Item s:\prism\.env s:\prism\.env.localhost.bak   # once, while on localhost
+Copy-Item s:\prism\.env.localhost.bak s:\prism\.env -Force  # to restore
+```
+
+### Known limitation
+
+A cloudflared **quick tunnel is not reliable enough to bet a demo on.** Measured
+here: it survived roughly 40 minutes before dying with repeated
+`failed to dial to edge with quic: timeout` errors, after which the public URL
+returned HTTP 530. If remote access has to work at a fixed time, either watch
+the tunnel and be ready to redo the four steps above, or run the demo on one
+machine and skip the tunnel entirely.
+
+### Stopping it
+
+```powershell
+Stop-Process -Name cloudflared -Force
+Copy-Item s:\prism\.env.localhost.bak s:\prism\.env -Force
+```
+
+Restart the backend afterwards. The `--host` flag and the Vite proxy are
+harmless on localhost, so there is nothing else to revert.
+
+---
+
 ## Current state (M0 complete)
 
 | Area | State |

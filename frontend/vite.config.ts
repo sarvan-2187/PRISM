@@ -10,10 +10,29 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, './src') },
   },
   server: {
-    // WebAuthn requires a secure context. localhost counts, so the demo runs
-    // here without TLS. Do not change this hostname after registering a
-    // passkey: the RP ID is bound to it and every credential would break.
     port: 5173,
     strictPort: true,
+
+    // Bind 0.0.0.0 so the LAN and any tunnel can reach the dev server.
+    host: true,
+
+    // Vite 5.4.12+ rejects requests whose Host header it does not recognise
+    // with a bare "Blocked request. This host is not allowed." Tunnel
+    // hostnames are random, so the domains have to be allowed by suffix.
+    allowedHosts: ['.trycloudflare.com', '.loca.lt', '.ngrok-free.app', '.ngrok.io'],
+
+    /*
+     * Proxy the API through this same server.
+     *
+     * This is what makes remote access work at all. One origin means the
+     * browser never makes a cross-site request, so the backend's CORS rule
+     * and the `sameSite: 'lax'` session cookie both keep working untouched,
+     * and VITE_API_URL stops mattering: a visitor's browser no longer tries
+     * to reach "localhost:4000" on their own machine.
+     */
+    proxy: {
+      '/api': { target: 'http://localhost:4000', changeOrigin: false },
+      '/health': { target: 'http://localhost:4000', changeOrigin: false },
+    },
   },
 });

@@ -11,7 +11,14 @@
 
 import type { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+/*
+ * Empty by default so every request is relative ("/api/v1/...") and travels
+ * through the Vite proxy. That keeps the app on ONE origin, which is what
+ * makes it work over a tunnel: a hardcoded localhost:4000 would point at the
+ * visitor's own machine, and a second origin would break the session cookie.
+ * Override only if you deliberately want to hit a different backend.
+ */
+const API_URL = import.meta.env.VITE_API_URL ?? '';
 
 /** Option shapes are derived from the library so they cannot drift out of sync. */
 export type RegistrationOptions = Parameters<typeof startRegistration>[0];
