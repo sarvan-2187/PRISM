@@ -12,7 +12,7 @@
  * details.
  */
 import crypto from 'crypto';
-import { query } from '../../db/pool';
+import { query, getClient } from '../../db/pool';
 import redis from '../../utils/redis';
 import { generateNonce } from '../../utils/crypto';
 import { intentHash, hashesMatch, LockedIntent } from '../../utils/canonical';
@@ -20,12 +20,15 @@ import { policy, isDisabled } from '../../config/policy';
 import { TransactionRow } from '../../db/types';
 import { audit } from '../audit/logger';
 import { PrismError } from '../../api/errors';
+import { attestationChain } from '../attestation/chain';
 
 export interface LockRequest {
   payerUserId: string;
   payerAccountId: string;
   payeeAccountId: string;
   amountMinor: number;
+  /** Set when this intent supersedes an earlier one (an amendment). */
+  amendedFrom?: string;
 }
 
 export interface LockResult {
@@ -67,24 +70,51 @@ export class IntentLockModule {
     };
     const hash = intentHash(intent);
 
-    await query(
-      `INSERT INTO transactions
-         (id, payer_user_id, payer_account_id, payee_account_id, amount_minor,
-          currency, intent_hash, nonce, lock_version, created_at, expires_at, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING')`,
-      [
+    // Insert the row and write the chain root (INTENT_LOCKED, rooted in the
+    // intent hash) in one transaction: a transaction without its chain root, or
+    // a chain root without its transaction, is not a state the system can act on.
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO transactions
+           (id, payer_user_id, payer_account_id, payee_account_id, amount_minor,
+            currency, intent_hash, nonce, lock_version, created_at, expires_at, status, amended_from)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING',$11)`,
+        [
+          txId,
+          req.payerUserId,
+          req.payerAccountId,
+          req.payeeAccountId,
+          req.amountMinor,
+          policy.currency,
+          hash,
+          nonce,
+          createdAt,
+          expiresAt,
+          req.amendedFrom ?? null,
+        ]
+      );
+      await attestationChain.append(
         txId,
-        req.payerUserId,
-        req.payerAccountId,
-        req.payeeAccountId,
-        req.amountMinor,
-        policy.currency,
-        hash,
-        nonce,
-        createdAt,
-        expiresAt,
-      ]
-    );
+        'INTENT_LOCKED',
+        {
+          amountMinor: req.amountMinor,
+          payeeAccountId: req.payeeAccountId,
+          currency: policy.currency,
+          createdAt,
+          expiresAt,
+          amendedFrom: req.amendedFrom ?? null,
+        },
+        { client }
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     // Replay defence layer 1. RESERVED now, CONSUMED at settlement — never
     // deleted, because a missing key is indistinguishable from an expired one

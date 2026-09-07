@@ -12,7 +12,18 @@ import { riskEngine } from '../modules/risk/riskEngine';
 import { semantic } from '../modules/semantic/intentCheck';
 import { settlement } from '../modules/ledger/settlement';
 import { audit } from '../modules/audit/logger';
+import { attestationChain } from '../modules/attestation/chain';
 import { policy, disabledControls } from '../config/policy';
+import { AuthorizationStage } from '../db/types';
+
+/** Stages every NORMAL payment must have in its chain before it can settle. */
+const REQUIRED_STAGES: AuthorizationStage[] = [
+  'INTENT_LOCKED',
+  'WEBAUTHN_APPROVED',
+  'CONTEXT_VERIFIED',
+  'RISK_APPROVED',
+  'SETTLEMENT_AUTHORIZED',
+];
 
 const router = Router();
 router.use(defaultLimiter);
@@ -313,14 +324,21 @@ router.post(
       fail('TAMPER_BLOCKED');
     }
 
+    // Every check from here writes one step into the authorization chain. The
+    // chain is rooted in tx.intent_hash; settlement later refuses unless it can
+    // reverify the whole thing and every mandatory stage is present. A step
+    // that never gets written is a mandatory stage that never ran.
+    const attempt = await attestationChain.startAttempt(tx.id);
+
     // 5. Signature over that exact hash.
     await identity.verifyPaymentAssertion(req.userId!, tx.id, tx.intent_hash, req.body.assertion);
-
-    // 6. Context + risk.
-    const snapshot = context.snapshot(req, {
-      deliberationMs: Number(req.body.deliberationMs) || undefined,
-      credentialId: req.body.assertion?.id,
+    await attestationChain.append(tx.id, 'WEBAUTHN_APPROVED', {
+      credentialId: String(req.body.assertion?.id ?? ''),
+      verified: true,
     });
+
+    // 6. Context.
+    const snapshot = context.snapshot(req, { credentialId: req.body.assertion?.id });
     const signals = await context.evaluate(
       req.userId!,
       snapshot,
@@ -332,11 +350,18 @@ router.post(
       userId: req.userId,
       data: { ...signals },
     });
+    await attestationChain.append(tx.id, 'CONTEXT_VERIFIED', { ...signals });
 
+    // 7. Risk.
     const risk = await riskEngine.evaluate(tx.id, req.userId!, {
       ...signals,
       amountMinor: parseInt(tx.amount_minor, 10),
     });
+    await query(`UPDATE transactions SET risk_decision = $2, fired_rule_ids = $3 WHERE id = $1`, [
+      tx.id,
+      risk.decision,
+      risk.firedRuleIds,
+    ]);
 
     if (risk.decision === 'BLOCK') {
       await intentLock.markFailed(tx.id, 'RISK_BLOCKED', 'BLOCKED');
@@ -352,8 +377,9 @@ router.post(
     }
 
     if (risk.decision === 'STEP_UP') {
-      // No money moves and the nonce is untouched. The transaction stays
-      // replayable by nobody and retryable by the genuine user.
+      // No money moves and the nonce is untouched. No SEMANTIC_VERIFIED step for
+      // this attempt yet, so the capability cannot be minted and nothing
+      // settles until /payment/:id/step-up records that stage.
       await query(`UPDATE transactions SET status = 'STEP_UP_REQUIRED' WHERE id = $1`, [tx.id]);
       const { rows } = await query<AccountRow>('SELECT * FROM accounts WHERE id = $1', [
         tx.payee_account_id,
@@ -368,8 +394,32 @@ router.post(
       return;
     }
 
-    // 7. Settle.
-    const result = await settlement.settle(tx);
+    await attestationChain.append(tx.id, 'RISK_APPROVED', {
+      score: risk.score,
+      decision: risk.decision,
+      firedRuleIds: risk.firedRuleIds,
+    });
+
+    // 8. Settlement authorization: mint the capability from the complete chain.
+    await attestationChain.append(tx.id, 'SETTLEMENT_AUTHORIZED', { mode: 'NORMAL' });
+    const capability = await attestationChain.mintCapability(
+      tx.id,
+      attempt,
+      tx.intent_hash,
+      [...REQUIRED_STAGES],
+      'NORMAL',
+      policy.intentTtlSeconds
+    );
+    await query(`UPDATE transactions SET status = 'AUTHORIZED' WHERE id = $1`, [tx.id]);
+    await audit.log('SETTLEMENT_AUTHORIZED', {
+      transactionId: tx.id,
+      userId: req.userId,
+      data: { attempt, capabilityId: capability.id },
+    });
+
+    // 9. Settle — verifies the chain and consumes the capability atomically
+    // with the ledger write.
+    const result = await settlement.settle(tx, capability);
     await intentLock.consumeNonce(tx.nonce);
     await context.updateBaseline(req.userId!, snapshot);
 

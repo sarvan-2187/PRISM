@@ -111,6 +111,25 @@ async function seed() {
     seeded++;
   }
 
+  // ── Ledger reconciliation (migration 002) ───────────────────────────
+  // The 20 historical transactions above post 20 DEBITs against Asha's account
+  // but the balances were inserted as fixed constants, so SUM(ledger) has never
+  // reconciled against balance_minor. Set the opening float so it does:
+  //   balance = opening + SUM(CREDIT) - SUM(DEBIT).
+  await query(
+    `UPDATE accounts a SET opening_balance_minor = a.balance_minor - COALESCE((
+       SELECT SUM(CASE WHEN le.direction = 'CREDIT' THEN le.amount_minor ELSE -le.amount_minor END)
+         FROM ledger_entries le WHERE le.account_id = a.id), 0)`
+  );
+
+  // Quarantine account — where duress-held funds sit until released. Recreated
+  // here because db:reset truncates accounts, which drops the row 002 inserted.
+  await query(
+    `INSERT INTO accounts (user_id, display_name, handle, balance_minor, opening_balance_minor, is_external)
+     VALUES (NULL, 'PRISM Quarantine', 'quarantine@prism', 0, 0, FALSE)
+     ON CONFLICT (handle) DO NOTHING`
+  );
+
   console.log('[Seed] Done.');
   console.log(`  users:        Asha Menon (asha@prism.demo), Priya Sharma (priya@prism.demo)`);
   console.log(`  accounts:     asha@prism ₹1,20,000 · priya@prism ₹8,000`);

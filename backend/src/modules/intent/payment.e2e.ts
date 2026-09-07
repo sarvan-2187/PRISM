@@ -449,6 +449,9 @@ async function cleanup(): Promise<void> {
       );
       await query('DELETE FROM ledger_entries WHERE transaction_id = ANY($1)', [createdTxIds]);
       await query('DELETE FROM audit_logs WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM settlement_capabilities WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM duress_alerts WHERE transaction_id = ANY($1)', [createdTxIds]);
+      await query('DELETE FROM authorization_steps WHERE transaction_id = ANY($1)', [createdTxIds]);
       await query('DELETE FROM transactions WHERE id = ANY($1)', [createdTxIds]);
       for (const { nonce } of nonces.rows) await redis.del(`nonce:${nonce}`);
       for (const id of createdTxIds) await redis.del(`challenge:auth:${id}`);

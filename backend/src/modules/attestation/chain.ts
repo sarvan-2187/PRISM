@@ -315,6 +315,29 @@ export class AttestationChainModule {
     return rows;
   }
 
+  /**
+   * Begin (or continue) an authorization attempt and return its number.
+   *
+   * intentLock.lock() writes the attempt-1 root. The first /authorize continues
+   * attempt 1. A re-authorization after a step-up finds attempt 1 already used
+   * past its root, so it opens attempt 2 with a fresh INTENT_LOCKED linked to
+   * the previous tip — the chain stays continuous across the retry.
+   */
+  async startAttempt(transactionId: string): Promise<number> {
+    const tip = (
+      await query<Pick<AuthorizationStepRow, 'attempt' | 'seq' | 'stage'>>(
+        `SELECT attempt, seq, stage FROM authorization_steps
+          WHERE transaction_id = $1 ORDER BY attempt DESC, seq DESC LIMIT 1`,
+        [transactionId]
+      )
+    ).rows[0];
+
+    if (!tip) fail('CHAIN_INVALID', { reason: 'transaction has no INTENT_LOCKED root' });
+    if (tip.stage === 'INTENT_LOCKED' && tip.seq === 0) return tip.attempt; // fresh, unused
+    const r = await this.append(transactionId, 'INTENT_LOCKED', { reattempt: true });
+    return r.attempt;
+  }
+
   /** Highest attempt number recorded for a transaction (0 if none). */
   async currentAttempt(transactionId: string, client?: PoolClient): Promise<number> {
     const rows = (
