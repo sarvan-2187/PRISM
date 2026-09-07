@@ -10,6 +10,7 @@
  */
 
 import type { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+import type { GrantBody } from './offline-store';
 
 /*
  * Empty by default so every request is relative ("/api/v1/...") and travels
@@ -194,6 +195,35 @@ export const api = {
       riskThresholds: { stepUpThreshold: number; blockThreshold: number };
       disabledControls: string[];
     }>('/policy'),
+
+  // ── Offline authorization (BLACKOUT / FC-01-A) ─────────────────────
+  // Arm while online — nothing below this point needs a network call before
+  // a blackout. See lib/offline-intent.ts and lib/offline-store.ts.
+
+  /** Arm this device: a capped, payee-restricted, single-use-slot grant. */
+  offlineGrantIssue: () =>
+    request<{ token: string; grant: GrantBody }>('/offline/grant', { method: 'POST' }),
+  /** What this device currently has armed, if anything. */
+  offlineGrantStatus: () =>
+    request<{ armed: boolean; grantId?: string; notAfter?: string; slots?: number }>(
+      '/offline/grant'
+    ),
+  /** Redeem a voucher produced while offline. Runs live risk + policy on reconnect. */
+  offlineRedeem: (voucher: {
+    token: string;
+    intent: unknown;
+    intentHash: string;
+    assertion: unknown;
+  }) =>
+    request<{
+      decision: 'APPROVED';
+      score: number;
+      reasons: string[];
+      settledAt: string;
+      balanceMinor: number;
+      balanceFormatted: string;
+      txId: string;
+    }>('/offline/redeem', { method: 'POST', body: JSON.stringify(voucher) }),
 
   // ── Cards ───────────────────────────────────────────────────────────
   // PENDING BACKEND (requested from S1). Both calls 404 until the cards

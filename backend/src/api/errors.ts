@@ -45,6 +45,13 @@ export const FAILURES = {
   CHAIN_INCOMPLETE: [403, 'A required authorization step is missing.'],
   CAPABILITY_INVALID: [403, 'The settlement authorization is not valid or has expired.'],
   POLICY_DENIED: [403, 'A payment policy refused this transaction.'],
+  // Offline authorization (003, BLACKOUT). GRANT_* failures are about the
+  // envelope the device was carrying, distinct from TAMPER_BLOCKED /
+  // SIG_INVALID / REPLAY_BLOCKED, which are about the voucher it produced
+  // while offline and are deliberately the SAME codes the online path uses.
+  GRANT_INVALID: [403, 'This offline authorization grant is not valid.'],
+  GRANT_EXPIRED: [410, 'This offline authorization window has closed.'],
+  OFFLINE_NOT_ARMED: [409, 'This device has no armed offline authorization.'],
 } as const;
 
 export type FailureCode = keyof typeof FAILURES;

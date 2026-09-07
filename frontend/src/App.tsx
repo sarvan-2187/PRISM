@@ -37,17 +37,19 @@ import Scan from '@/pages/Scan';
 import Profile from '@/pages/Profile';
 import Settings from '@/pages/Settings';
 import Policy from '@/pages/Policy';
+import Offline from '@/pages/Offline';
 import AttackDashboard from '@/pages/attacks/Dashboard';
 import AttackDetail from '@/pages/attacks/AttackDetail';
 
 /** Views that get the wide column. Everything else is the focused flow. */
-const WIDE = ['/home', '/profile', '/policy', '/attacks'];
+const WIDE = ['/home', '/profile', '/settings', '/policy', '/offline', '/attacks'];
 
 const NAV = [
   { to: '/home', label: 'Home' },
   { to: '/pay', label: 'Send' },
   { to: '/receive', label: 'Receive' },
   { to: '/scan', label: 'Scan' },
+  { to: '/offline', label: 'Offline' },
   { to: '/profile', label: 'Passkeys' },
   { to: '/settings', label: 'Settings' },
   { to: '/policy', label: 'Policy' },
@@ -191,6 +193,11 @@ function Shell() {
           <Route path="/pay/:txId/timeline" element={guard(<Timeline />)} />
           <Route path="/receive" element={guard(<Receive />)} />
           <Route path="/scan" element={guard(<Scan />)} />
+          <Route path="/offline" element={guard(<Offline />)} />
+          <Route path="/profile" element={guard(<Profile />)} />
+          <Route path="/settings" element={guard(<Settings />)} />
+          <Route path="/attacks" element={guard(<AttackDashboard />)} />
+          <Route path="/attacks/:scenarioId" element={guard(<AttackDetail />)} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
 

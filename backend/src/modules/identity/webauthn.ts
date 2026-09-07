@@ -208,6 +208,26 @@ export class IdentityModule {
     await audit.log('ASSERTION_VERIFIED', { transactionId: txId, userId });
   }
 
+  /**
+   * Verify an assertion produced OFFLINE (003, BLACKOUT) against a hash the
+   * device computed and signed without ever calling paymentChallenge — so
+   * unlike verifyPaymentAssertion there is no Redis-issued challenge to check
+   * the claim against. The device-binding and tamper checks that would
+   * normally live in that Redis lookup are done by the caller (offline/redeem.ts)
+   * against the signed grant before this runs; this method's only job is the
+   * same cryptographic check verifyAssertion always does: does this signature
+   * verify over exactly this hash, from a credential this user still holds.
+   */
+  async verifyOfflineAssertion(
+    userId: string,
+    txId: string,
+    intentHash: string,
+    response: AuthenticationResponseJSON
+  ): Promise<void> {
+    await this.verifyAssertion(userId, response, intentHash);
+    await audit.log('ASSERTION_VERIFIED', { transactionId: txId, userId, data: { mode: 'OFFLINE' } });
+  }
+
   // ── Shared assertion verification ─────────────────────────────────────
 
   private async verifyAssertion(

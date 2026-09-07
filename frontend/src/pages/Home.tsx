@@ -9,10 +9,11 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { KeyRound, QrCode, RefreshCw, Radiation } from 'lucide-react';
+import { KeyRound, QrCode, RefreshCw, Radiation, WifiOff } from 'lucide-react';
 import { api, ApiError, TransactionView } from '@/lib/api-client';
 import { demoSessionRevealEnabled, revealMySession } from '@/lib/demoSessionApi';
 import { useSession } from '@/lib/session';
+import { loadGrant, saveGrant } from '@/lib/offline-store';
 import { relativeTime } from '@/lib/format';
 import { statusBadge, STATUS_LABEL } from '@/lib/events';
 import { Button } from '@/components/ui/button';
@@ -40,6 +41,19 @@ export default function Home() {
   useEffect(() => {
     void demoSessionRevealEnabled().then(setLabEnabled);
   }, []);
+
+  // Arm offline authorization silently, right after landing signed in — the
+  // one moment PRISM can still be asked anything before a blackout. Opportunistic:
+  // a failure here (offline already, or a transient error) just means the
+  // device stays unarmed, and the Offline page always offers the same button.
+  useEffect(() => {
+    if (!me) return;
+    if (loadGrant(me.userId)) return; // already armed and still live
+    api
+      .offlineGrantIssue()
+      .then(({ token, grant }) => saveGrant(me.userId, { token, grant }))
+      .catch(() => {});
+  }, [me]);
 
   const copySessionForLab = useCallback(async () => {
     setCopyStatus('idle');
@@ -223,6 +237,25 @@ export default function Home() {
             <CardContent>
               <Button asChild variant="secondary" block>
                 <Link to="/receive">Show a QR request</Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-body-lg">
+                <WifiOff className="size-4 text-primary" aria-hidden="true" />
+                Offline authorization
+              </CardTitle>
+              <CardDescription>
+                This device arms itself automatically. If the network drops mid-payment, a signed,
+                capped grant lets it approve locally with no server — and stay replay-proof when
+                you reconnect.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="secondary" block>
+                <Link to="/offline">View offline status</Link>
               </Button>
             </CardContent>
           </Card>

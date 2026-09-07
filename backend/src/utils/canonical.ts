@@ -16,7 +16,13 @@ import crypto from 'crypto';
  * a float or a formatted string: "5000.00" and "5000" hash differently and
  * the difference is invisible in a log.
  *
- * The client never computes this. The server computes it and hands it over.
+ * The client never computes this online — the server computes it and hands
+ * it over. The one exception is an offline-approved payment (see
+ * modules/offline/), where the device has no server to ask and must compute
+ * this itself, from a pre-issued signed grant, before signing it locally.
+ * The server does not take that computation on trust: on reconnect it
+ * recomputes the hash from the same intent with this same function and
+ * compares, so a tampered field is caught here exactly as it would be online.
  */
 export interface LockedIntent {
   amountMinor: number;

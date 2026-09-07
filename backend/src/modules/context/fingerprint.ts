@@ -111,6 +111,13 @@ export class ContextModule {
        * S1 can remove the argument whenever convenient.
        */
       deliberationMs?: number;
+      /**
+       * Offline redemption (003, BLACKOUT) has no `:id` route param — the
+       * transaction is created mid-request from the voucher body, not read
+       * from the URL. Lets that caller supply the txId explicitly instead of
+       * duplicating this method's fingerprinting logic.
+       */
+      txId?: string;
     } = {}
   ): ContextSnapshot {
     const ua = req.headers['user-agent'] ?? '';
@@ -134,7 +141,7 @@ export class ContextModule {
       networkFamily: net.family,
       acceptLanguage: String(lang).slice(0, 32),
       credentialId: extra.credentialId ?? null,
-      txId: (req.params?.id as string | undefined) ?? null,
+      txId: extra.txId ?? (req.params?.id as string | undefined) ?? null,
     };
   }
 

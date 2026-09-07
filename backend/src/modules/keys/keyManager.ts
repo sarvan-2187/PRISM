@@ -53,6 +53,9 @@ function deriveKey(info: string, length = 32): Buffer {
 
 const attestKey = deriveKey('prism/attest/v1');
 const capabilityKey = deriveKey('prism/capability/v1');
+// Offline authorization grant (003, BLACKOUT). Its own key, so a grant can
+// never verify as a step MAC, a capability MAC, or a receipt signature.
+const grantKey = deriveKey('prism/offline-grant/v1');
 
 if (!config.attestationRoot) {
   console.warn(
@@ -184,6 +187,17 @@ export class KeyManagementModule {
   /** MAC a settlement capability. Separate key, so a step MAC can never pass as one. */
   macCapability(canonical: string): string {
     return crypto.createHmac('sha256', capabilityKey).update(canonical, 'utf8').digest('base64url');
+  }
+
+  /**
+   * MAC an offline authorization grant (003, BLACKOUT). Same rationale as
+   * macCapability: HMAC, not a signature — this server both issues the grant
+   * (while online) and redeems it (on reconnect), so asymmetry would buy
+   * nothing. A distinct key means a grant can never verify as a step MAC, a
+   * capability MAC, or a receipt signature, and vice versa.
+   */
+  macGrant(canonical: string): string {
+    return crypto.createHmac('sha256', grantKey).update(canonical, 'utf8').digest('base64url');
   }
 
   /**

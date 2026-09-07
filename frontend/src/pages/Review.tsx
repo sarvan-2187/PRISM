@@ -18,6 +18,7 @@ import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
 import { LiveLog } from '@/components/LiveLog';
 import { usePoll } from '@/lib/usePoll';
 import { useSession } from '@/lib/session';
+import { useOnline } from '@/lib/useOnline';
 import { isTerminal } from '@/lib/events';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -33,6 +34,7 @@ export default function Review() {
   const { txId = '' } = useParams();
   const navigate = useNavigate();
   const { refresh } = useSession();
+  const online = useOnline();
   const [tx, setTx] = useState<TransactionView | null>(null);
   const [remaining, setRemaining] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -107,6 +109,16 @@ export default function Review() {
           return;
         }
         setError({ code: err.failureCode, message: err.message });
+      } else if (!navigator.onLine || err instanceof TypeError) {
+        // This screen was built for a live server: approving here needs
+        // /payment/:id/challenge and /authorize, both network calls, and it
+        // has no payeeAccountId to build an offline voucher from — only the
+        // Offline page's own allow-list does. If the blackout hit mid-review,
+        // that page is where to finish this payment, not here.
+        setError({
+          code: 'OFFLINE',
+          message: 'No connection. Approve this from the Offline page instead — it works with none.',
+        });
       } else {
         setError({ code: 'PASSKEY', message: describeWebAuthnError(err) });
       }
@@ -230,6 +242,18 @@ export default function Review() {
               </Alert>
               <Button asChild variant="secondary" block className="mt-4">
                 <Link to="/pay">Start a new payment</Link>
+              </Button>
+            </>
+          ) : !online ? (
+            <>
+              <Alert variant="warning" className="mt-5">
+                <AlertDescription>
+                  No connection. This screen needs one — the Offline page approves a payment with
+                  none, from a grant armed while you still had a connection.
+                </AlertDescription>
+              </Alert>
+              <Button asChild block className="mt-4">
+                <Link to="/offline">Go to Offline</Link>
               </Button>
             </>
           ) : (

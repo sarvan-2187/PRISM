@@ -10,7 +10,7 @@
     "db:seed": "ts-node src/db/seed.ts",
     "db:reset": "ts-node src/db/reset.ts",
     "provision:attacks": "ts-node --transpile-only src/db/provisionAttacks.ts",
-    "test": "npm run test:hash && npm run test:canon2 && npm run test:challenge && npm run test:risk && npm run test:network && npm run test:semantic && npm run test:qr && npm run test:chain",
+    "test": "npm run test:hash && npm run test:canon2 && npm run test:challenge && npm run test:risk && npm run test:network && npm run test:semantic && npm run test:qr && npm run test:chain && npm run test:offline",
     "test:hash": "ts-node src/utils/canonical.test.ts",
     "test:canon2": "ts-node src/utils/attestationCanonical.test.ts",
     "test:chain": "ts-node --transpile-only src/modules/attestation/chain.test.ts",
@@ -20,6 +20,7 @@
     "test:network": "ts-node src/modules/context/network.test.ts",
     "test:semantic": "ts-node src/modules/semantic/intentCheck.test.ts",
     "test:qr": "ts-node src/modules/qr/dynamicQr.test.ts",
+    "test:offline": "ts-node --transpile-only src/modules/offline/offline.test.ts",
     "test:e2e": "ts-node --transpile-only src/modules/intent/payment.e2e.ts",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src/**/*.ts"

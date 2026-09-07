@@ -27,6 +27,10 @@ export const EVENTS: Record<string, { label: string; tone: Tone }> = {
   PAYMENT_SETTLED: { label: 'Money moved, exactly once', tone: 'ok' },
   PAYMENT_BLOCKED: { label: 'Payment refused', tone: 'danger' },
   CREDENTIAL_REVOKED: { label: 'Passkey revoked', tone: 'warn' },
+  // Offline authorization (BLACKOUT / FC-01-A)
+  OFFLINE_GRANT_ISSUED: { label: 'Device armed for offline approval', tone: 'plain' },
+  OFFLINE_VOUCHER_REDEEMED: { label: 'Offline voucher redeemed and settled', tone: 'ok' },
+  OFFLINE_VOUCHER_REJECTED: { label: 'Offline voucher rejected', tone: 'danger' },
 };
 
 export function describeEvent(event: string): { label: string; tone: Tone } {
@@ -98,6 +102,7 @@ export function summarise(data: Record<string, unknown>): string[] {
   if (typeof data.deliberationMs === 'number') {
     out.push(`considered for ${Math.round(data.deliberationMs / 100) / 10}s`);
   }
+  if (data.offline === true) out.push('signed with no network connection');
   return out;
 }
 

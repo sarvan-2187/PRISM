@@ -14,6 +14,8 @@ import { settlement } from '../modules/ledger/settlement';
 import { audit } from '../modules/audit/logger';
 import { attestationChain } from '../modules/attestation/chain';
 import { policyFirewall } from '../modules/policy/firewall';
+import { offlineGrant } from '../modules/offline/grant';
+import { offlineRedeem } from '../modules/offline/redeem';
 import { policy, disabledControls } from '../config/policy';
 import { AuthorizationStage } from '../db/types';
 
@@ -595,6 +597,51 @@ router.post(
 
     const tx = await intentLock.get(locked.txId);
     res.status(201).json(await present(tx));
+  })
+);
+
+// ──────────────────────────────────────────────────────────────
+// Offline authorization — BLACKOUT (FC-01-A)
+//
+// Arm while online (POST /offline/grant), spend with no network at all (the
+// device never calls this server to approve — it signs locally using the
+// grant it already has), then redeem on reconnect (POST /offline/redeem).
+// See modules/offline/grant.ts and redeem.ts for the design.
+// ──────────────────────────────────────────────────────────────
+
+/** Arm this device: a capped, payee-restricted, single-use-slot grant. */
+router.post(
+  '/offline/grant',
+  requireSession,
+  strictLimiter,
+  wrap(async (req, res) => {
+    const payerAccount = await accountFor(req.userId!);
+    const { grant, token } = await offlineGrant.issue(req.userId!, payerAccount.id);
+    res.status(201).json({ token, grant });
+  })
+);
+
+/** What this device currently has armed, if anything — for the Offline page. */
+router.get(
+  '/offline/grant',
+  requireSession,
+  wrap(async (req, res) => {
+    const current = await offlineGrant.current(req.userId!);
+    res.json(current ? { armed: true, ...current } : { armed: false });
+  })
+);
+
+/**
+ * Redeem a voucher produced while offline. Everything the online authorize
+ * pipeline does after signature verification — context, risk, policy,
+ * settlement — runs here too, live: a voucher can be authentic and still be
+ * refused.
+ */
+router.post(
+  '/offline/redeem',
+  requireSession,
+  wrap(async (req, res) => {
+    res.json(await offlineRedeem.redeem(req));
   })
 );
 

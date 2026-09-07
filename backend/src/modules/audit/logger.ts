@@ -40,7 +40,11 @@ export type AuditEvent =
   | 'POLICY_DENIED'
   | 'DURESS_TRIGGERED'
   | 'DURESS_RELEASED'
-  | 'INTENT_AMENDED';
+  | 'INTENT_AMENDED'
+  // Offline authorization (003, BLACKOUT)
+  | 'OFFLINE_GRANT_ISSUED'
+  | 'OFFLINE_VOUCHER_REDEEMED'
+  | 'OFFLINE_VOUCHER_REJECTED';
 
 export class AuditModule {
   async log(

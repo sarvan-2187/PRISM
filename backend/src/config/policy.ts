@@ -107,6 +107,25 @@ export const policy = {
    * Refused entirely when NODE_ENV=production — see disabledControls().
    */
   disableableControls: ['intentLock', 'replayGuard', 'expiryGuard', 'qrSignature', 'riskEngine'] as const,
+
+  /**
+   * BLACKOUT (FC-01-A): pre-positioned offline authorization.
+   *
+   * Before a blackout, the device is handed a signed, capped grant — a small
+   * number of pre-reserved single-use slots, a per-payment amount ceiling,
+   * and a fixed payee whitelist. The device cannot widen any of these:
+   * doing so breaks a MAC it has no key for. Blast radius of a fully
+   * compromised offline device is therefore bounded and statable up front:
+   * slots * maxAmountMinor, to already-known payees only, inside one window.
+   */
+  offline: {
+    /** Pre-reserved single-use nonces per grant. Bounds how many offline payments one grant can cover. */
+    slots: 3,
+    /** Per-payment cap while offline — well under AMOUNT_ANOMALY, so a stolen device cannot make it look ordinary either. */
+    maxAmountMinor: 500000, // ₹5,000
+    /** How long a grant stays spendable after arming. */
+    windowSeconds: 900, // 15 minutes
+  },
 } as const;
 
 export type DisableableControl = (typeof policy.disableableControls)[number];
