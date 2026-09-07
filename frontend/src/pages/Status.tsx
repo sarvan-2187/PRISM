@@ -1,44 +1,54 @@
 /**
- * Outcome — receipt, or the reason it stopped.
+ * Outcome. A receipt, or the reason it stopped.
  *
  * Unknown failure codes fall back to a generic blocked state rather than
- * crashing. That matters beyond tidiness: a Future Card may introduce a new
- * code at midnight, and the UI has to degrade instead of breaking.
+ * crashing. That matters beyond tidiness: the rules can change mid-event, and
+ * a code this build has never seen has to degrade into a sentence rather than
+ * a blank screen.
  */
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, ApiError, TransactionView } from '../lib/api-client';
+import { api, ApiError, TransactionView } from '@/lib/api-client';
+import { LiveLog } from '@/components/LiveLog';
+import { isTerminal } from '@/lib/events';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
 
 /** Plain English for each documented refusal, and what it stopped. */
 const FAILURES: Record<string, { title: string; blurb: string }> = {
   TAMPER_BLOCKED: {
-    title: 'Details were altered after approval',
+    title: 'The details were altered after approval',
     blurb:
-      'The signed approval no longer matches the locked transaction. Someone changed the amount or the recipient after you approved.',
+      'The signed approval no longer matches the locked transaction. Someone changed the amount or the recipient between approval and settlement, and the signature stopped matching the moment they did.',
   },
   REPLAY_BLOCKED: {
     title: 'Already processed',
-    blurb: 'This payment has been settled once. A captured request cannot be sent again.',
+    blurb:
+      'This payment settled once. A captured request cannot be sent a second time: the ledger refuses a duplicate entry at the database level, not in application code.',
   },
   INTENT_EXPIRED: {
-    title: 'Approval window closed',
-    blurb: 'The transaction was not approved within its window. Nothing was charged.',
+    title: 'The approval window closed',
+    blurb: 'This transaction was not approved in time. Nothing was charged.',
   },
   RISK_BLOCKED: {
-    title: 'Blocked as high risk',
-    blurb: 'The situation around this payment looked wrong. The reasons are listed below.',
+    title: 'Refused as high risk',
+    blurb:
+      'The circumstances around this payment scored past the refusal threshold. The rules that fired are listed below.',
   },
   STEP_UP_FAILED: {
-    title: 'Verification failed',
+    title: 'The amount could not be confirmed',
     blurb:
-      'The amount could not be confirmed. This payment is closed — start a new one if it was genuine.',
+      'The comprehension check was not passed. This payment is closed. If it was genuine, start a new one.',
   },
   INSUFFICIENT_FUNDS: {
-    title: 'Insufficient balance',
-    blurb: 'Not an attack — an ordinary business rule.',
+    title: 'Not enough balance',
+    blurb: 'An ordinary business rule rather than a security decision.',
   },
   SIG_INVALID: {
-    title: 'Signature did not verify',
+    title: 'The signature did not verify',
     blurb: 'The approval was not produced by a passkey registered to this account.',
   },
   ORIGIN_MISMATCH: {
@@ -54,64 +64,116 @@ export default function Status() {
 
   useEffect(() => {
     api.payment(txId).then(setTx, (err) =>
-      setError(err instanceof ApiError ? err.message : String(err))
+      setError(err instanceof ApiError ? err.message : 'Could not reach PRISM.')
     );
   }, [txId]);
 
-  if (error) return <div className="card"><div className="error">{error}</div></div>;
-  if (!tx) return <div className="card"><p className="muted">Loading…</p></div>;
+  if (error) {
+    return (
+      <Card>
+        <CardContent className="grid gap-4 pt-6">
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+          <Button asChild variant="secondary" block>
+            <Link to="/home">Back to your account</Link>
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!tx) {
+    return (
+      <Card aria-busy="true">
+        <CardContent className="grid gap-3 pt-6">
+          <p className="text-small text-secondary-foreground">Loading the result…</p>
+          <Skeleton className="h-3.5 w-[45%]" />
+        </CardContent>
+      </Card>
+    );
+  }
 
   const settled = tx.status === 'SETTLED';
   const failure = tx.failureCode
     ? (FAILURES[tx.failureCode] ?? {
-        title: 'Payment stopped',
-        blurb: 'This payment did not complete. No money moved.',
+        title: 'This payment stopped',
+        blurb: 'It did not complete, and no money moved.',
       })
     : null;
 
   return (
-    <div className="card">
-      {settled ? (
-        <>
-          <span className="badge ok">Settled</span>
-          <h1 style={{ marginTop: 12 }}>{tx.amountFormatted} sent</h1>
-          <p className="muted">
-            to {tx.payeeName} · {tx.payeeHandle}
-          </p>
-        </>
-      ) : (
-        <>
-          <span className="badge danger">{tx.failureCode ?? tx.status}</span>
-          <h1 style={{ marginTop: 12 }}>{failure?.title ?? 'Payment stopped'}</h1>
-          <p className="muted">{failure?.blurb}</p>
-          <p className="muted" style={{ marginTop: 12 }}>
-            <strong>No money moved.</strong> {tx.amountFormatted} to {tx.payeeName} was not sent.
-          </p>
-        </>
-      )}
+    <div className="animate-enter-up">
+      <Card>
+        <CardContent className="pt-6">
+          {settled ? (
+            <>
+              <Badge variant="success">Settled</Badge>
+              <h1 className="mt-4 text-h3 font-semibold">Payment sent</h1>
+              <div className="attested mt-5">
+                <div className="text-[44px] font-semibold leading-[1.1] tracking-[-0.03em] tabular max-md:text-h3">
+                  {tx.amountFormatted}
+                </div>
+                <div className="mt-2">
+                  to <strong className="font-semibold">{tx.payeeName}</strong>{' '}
+                  <span className="text-secondary-foreground">({tx.payeeHandle})</span>
+                </div>
+                <span className="mt-2 block text-caption text-muted-foreground">
+                  Confirmed by the ledger
+                </span>
+              </div>
+            </>
+          ) : (
+            <>
+              <Badge variant="destructive">{tx.failureCode ?? tx.status}</Badge>
+              <h1 className="mt-4 text-h3 font-semibold">
+                {failure?.title ?? 'This payment stopped'}
+              </h1>
+              <p className="mt-3 text-pretty text-body-lg text-secondary-foreground">
+                {failure?.blurb}
+              </p>
+              <Alert variant="success" className="mt-5">
+                <AlertDescription>
+                  <strong className="font-medium">No money moved.</strong> {tx.amountFormatted} to{' '}
+                  {tx.payeeName} was not sent, and the balance is unchanged.
+                </AlertDescription>
+              </Alert>
+            </>
+          )}
 
-      {tx.riskReasons.length > 0 && (
-        <div style={{ marginTop: 20 }}>
-          <h2>Why{tx.riskScore !== null ? ` (risk ${tx.riskScore})` : ''}</h2>
-          <ul className="reasons">
-            {tx.riskReasons.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
-          <p className="muted">
-            Every decision states the conditions that produced it. Nothing here is a
-            black-box score.
-          </p>
-        </div>
-      )}
+          {tx.riskReasons.length > 0 && (
+            <div className="mt-6">
+              <h2 className="font-semibold">
+                What PRISM saw
+                {tx.riskScore !== null ? ` (risk score ${tx.riskScore})` : ''}
+              </h2>
+              <ul className="my-3 list-disc pl-5 text-small">
+                {tx.riskReasons.map((r) => (
+                  <li key={r} className="mb-1 text-pretty">
+                    {r}
+                  </li>
+                ))}
+              </ul>
+              <p className="text-pretty text-small text-secondary-foreground">
+                Every decision states the conditions that produced it. There is no opaque score
+                here that cannot be explained.
+              </p>
+            </div>
+          )}
 
-      <div style={{ marginTop: 20 }}>
-        <Link to={`/pay/${txId}/timeline`}>
-          <button className="secondary">View security timeline</button>
-        </Link>
-        <Link to="/pay">
-          <button className="secondary">New payment</button>
-        </Link>
+          <div className="mt-6 flex flex-wrap gap-2 max-md:flex-col">
+            <Button asChild variant="secondary" className="flex-1">
+              <Link to={`/pay/${txId}/timeline`}>Full security timeline</Link>
+            </Button>
+            <Button asChild variant="secondary" className="flex-1">
+              <Link to="/pay">Send another payment</Link>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="mt-4">
+        <LiveLog txId={txId} live={!isTerminal(tx.status)} />
       </div>
     </div>
   );

@@ -3,7 +3,38 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>PRISM — Payment Risk &amp; Intent Security Model</title>
+
+    <!--
+      Geist for the interface, Instrument Serif for editorial headings only.
+      Both carry real fallback stacks: if the venue network drops, the app
+      degrades to system fonts instead of a blank page.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap"
+      rel="stylesheet"
+    />
+
+    <script>
+      // Applied before first paint so the theme never flashes. Mirrors the
+      // logic in src/lib/theme.ts; both read the same storage key.
+      (function () {
+        try {
+          var stored = localStorage.getItem('prism-theme');
+          var dark =
+            stored === 'dark' ||
+            (stored !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (e) {
+          /* private mode, blocked storage: fall through to light */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

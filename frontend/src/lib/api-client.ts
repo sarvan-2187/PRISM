@@ -187,4 +187,52 @@ export const api = {
       riskThresholds: { stepUpThreshold: number; blockThreshold: number };
       disabledControls: string[];
     }>('/policy'),
+
+  // ── Cards ───────────────────────────────────────────────────────────
+  // PENDING BACKEND (requested from S1). Both calls 404 until the cards
+  // table and the payeeCardNumber branch of /payment/initiate exist, which
+  // is exactly how the UI detects the feature: see cardsEnabled below.
+
+  /** The signed-in user's own cards, for display. Doubles as the probe. */
+  cards: () => request<CardView[]>('/cards'),
+
+  /**
+   * Send to a card number.
+   *
+   * The card is a POINTER, exactly like a QR code: the server resolves it to
+   * an account and the returned transaction names the real recipient, which
+   * the review screen then reads back. The intent hash binds the resolved
+   * payeeAccountId, never the card number, so a card that resolves somewhere
+   * unexpected is visible before approval rather than after.
+   */
+  initiateByCard: (payeeCardNumber: string, amountMinor: number) =>
+    request<TransactionView>('/payment/initiate', {
+      method: 'POST',
+      body: JSON.stringify({ payeeCardNumber, amountMinor }),
+    }),
 };
+
+export interface CardView {
+  cardId: string;
+  last4: string;
+  network: string;
+  holderName: string;
+}
+
+/**
+ * Is card sending available on this build?
+ *
+ * Probed rather than assumed, so the tab is honest before the backend lands
+ * and lights up on its own the moment it does, with no frontend change.
+ */
+export async function cardsEnabled(): Promise<boolean> {
+  try {
+    await api.cards();
+    return true;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return false;
+    // A 401 means signed out, not unsupported. Anything else is a real
+    // outage, and treating it as "off" is the safe read either way.
+    return false;
+  }
+}

@@ -1,50 +1,22 @@
 /**
- * Security timeline — what PRISM did, and why.
+ * Security timeline. What PRISM did, and why.
  *
- * This is what makes the attack demos self-evidencing: after any blocked
- * attempt, open this and the refusal is already recorded, in order, with the
- * conditions that produced it. It is worth more in judging than any amount of
- * visual polish, which is why it is built before the polish.
+ * This is what makes the attack demonstrations self-evidencing: after any
+ * blocked attempt, open this and the refusal is already recorded, in order,
+ * with the conditions that produced it. The event vocabulary lives in
+ * lib/events.ts and is shared with the live log, so the two can never
+ * describe the same event differently.
  */
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, ApiError, TimelineEvent, TransactionView } from '../lib/api-client';
-
-/** Plain English per audit event, so the trail reads rather than decodes. */
-const EVENTS: Record<string, { label: string; tone: 'ok' | 'warn' | 'danger' | 'plain' }> = {
-  INTENT_LOCKED: { label: 'Transaction frozen and hashed', tone: 'plain' },
-  CHALLENGE_ISSUED: { label: 'Challenge issued — the intent hash', tone: 'plain' },
-  ASSERTION_VERIFIED: { label: 'Passkey signature verified against that hash', tone: 'ok' },
-  CONTEXT_EVALUATED: { label: 'Device, network and history examined', tone: 'plain' },
-  RISK_EVALUATED: { label: 'Risk scored', tone: 'plain' },
-  STEP_UP_ISSUED: { label: 'Comprehension check issued', tone: 'warn' },
-  STEP_UP_PASSED: { label: 'Comprehension check passed', tone: 'ok' },
-  STEP_UP_FAILED: { label: 'Comprehension check failed', tone: 'danger' },
-  QR_ISSUED: { label: 'Signed payment request created', tone: 'plain' },
-  QR_REDEEMED: { label: 'Payment request scanned', tone: 'plain' },
-  PAYMENT_SETTLED: { label: 'Money moved, exactly once', tone: 'ok' },
-  PAYMENT_BLOCKED: { label: 'Payment refused', tone: 'danger' },
-};
-
-/** Fields worth surfacing; everything else stays folded away. */
-function summarise(data: Record<string, unknown>): string[] {
-  const out: string[] = [];
-  const push = (k: string, label: string) => {
-    if (data[k] !== undefined && data[k] !== null) out.push(`${label}: ${String(data[k])}`);
-  };
-  push('failureCode', 'code');
-  push('score', 'score');
-  push('decision', 'decision');
-  push('attemptsUsed', 'attempts used');
-  if (Array.isArray(data.firedRuleIds) && data.firedRuleIds.length)
-    out.push(`rules: ${(data.firedRuleIds as string[]).join(', ')}`);
-  if (Array.isArray(data.reasons) && data.reasons.length)
-    out.push(...(data.reasons as string[]));
-  if (data.challengeIsIntentHash) out.push('challenge = intent hash');
-  if (typeof data.deliberationMs === 'number')
-    out.push(`considered for ${Math.round(data.deliberationMs / 100) / 10}s`);
-  return out;
-}
+import { api, ApiError, TimelineEvent, TransactionView } from '@/lib/api-client';
+import { describeEvent, summarise, statusBadge, toneDot, STATUS_LABEL } from '@/lib/events';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { cn } from '@/lib/utils';
 
 export default function Timeline() {
   const { txId = '' } = useParams();
@@ -54,59 +26,122 @@ export default function Timeline() {
 
   useEffect(() => {
     api.timeline(txId).then(
-      ({ transaction, events }) => {
+      ({ transaction, events: rows }) => {
         setTx(transaction);
-        setEvents(events);
+        setEvents(rows);
       },
-      (err) => setError(err instanceof ApiError ? err.message : String(err))
+      (err) =>
+        setError(
+          err instanceof ApiError
+            ? err.message
+            : 'Could not reach PRISM. Check that the backend is running.'
+        )
     );
   }, [txId]);
 
-  if (error) return <div className="card"><div className="error">{error}</div></div>;
-  if (!tx) return <div className="card"><p className="muted">Loading…</p></div>;
+  if (error) {
+    return (
+      <Card>
+        <CardContent className="grid gap-4 pt-6">
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+          <Button asChild variant="secondary" block>
+            <Link to="/home">Back to your account</Link>
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!tx) {
+    return (
+      <Card aria-busy="true">
+        <CardContent className="grid gap-3 pt-6">
+          <p className="text-small text-secondary-foreground">Reading the audit trail…</p>
+          <Skeleton className="h-3.5 w-[60%]" />
+          <Skeleton className="h-3.5 w-[40%]" />
+        </CardContent>
+      </Card>
+    );
+  }
 
   const started = events.length ? new Date(events[0].at).getTime() : 0;
 
   return (
-    <div className="card">
-      <h1>Security timeline</h1>
-      <p className="muted">
-        {tx.amountFormatted} to {tx.payeeName} · {tx.status}
-        {tx.failureCode ? ` · ${tx.failureCode}` : ''}
-      </p>
+    <div className="animate-enter-up">
+      <Card>
+        <CardContent className="pt-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h1 className="text-h3 font-semibold">Security timeline</h1>
+            <Badge variant={statusBadge(tx.status)}>
+              {STATUS_LABEL[tx.status] ?? tx.status}
+            </Badge>
+          </div>
+          <p className="mt-2 text-small text-secondary-foreground">
+            {tx.amountFormatted} to {tx.payeeName}
+            {tx.failureCode ? ` · ${tx.failureCode}` : ''}
+          </p>
 
-      <ol className="timeline">
-        {events.map((e, i) => {
-          const meta = EVENTS[e.event] ?? { label: e.event, tone: 'plain' as const };
-          const detail = summarise(e.data);
-          const offset = started ? new Date(e.at).getTime() - started : 0;
-          return (
-            <li key={i} className={`tone-${meta.tone}`}>
-              <div className="tl-head">
-                <span className="tl-label">{meta.label}</span>
-                <span className="muted">+{(offset / 1000).toFixed(1)}s</span>
-              </div>
-              {detail.length > 0 && (
-                <ul className="tl-detail">
-                  {detail.map((d, j) => (
-                    <li key={j}>{d}</li>
-                  ))}
-                </ul>
-              )}
-            </li>
-          );
-        })}
-      </ol>
+          {events.length === 0 ? (
+            <div className="mt-6 rounded-lg border border-dashed border-border-strong px-6 py-10 text-center">
+              <h3 className="font-semibold">Nothing recorded yet</h3>
+              <p className="mx-auto mt-2 max-w-[44ch] text-pretty text-small text-secondary-foreground">
+                The first entry appears when the transaction is locked. If this stays empty, the
+                payment was never started.
+              </p>
+            </div>
+          ) : (
+            <ol className="mt-6 border-l border-border-strong pl-5">
+              {events.map((e, i) => {
+                const { label, tone } = describeEvent(e.event);
+                const detail = summarise(e.data);
+                const offset = started ? new Date(e.at).getTime() - started : 0;
+                return (
+                  <li key={`${e.at}-${i}`} className="relative pb-5 pl-1 last:pb-0">
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        'absolute -left-[25px] top-1.5 size-[9px] rounded-full outline outline-[3px] outline-background',
+                        toneDot(tone)
+                      )}
+                    />
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="text-pretty font-medium">{label}</span>
+                      <span className="shrink-0 text-caption tabular text-muted-foreground">
+                        +{(offset / 1000).toFixed(1)}s
+                      </span>
+                    </div>
+                    {detail.length > 0 && (
+                      <ul className="mt-1 list-disc pl-4 text-small text-secondary-foreground">
+                        {detail.map((d, j) => (
+                          <li key={j} className="text-pretty">
+                            {d}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          )}
 
-      {events.length === 0 && <p className="muted">No events recorded yet.</p>}
+          <p className="mt-6 text-pretty text-small text-secondary-foreground">
+            Append-only. Entries are added, never edited or deleted, so this trail is evidence
+            rather than a summary written after the fact.
+          </p>
 
-      <p className="muted" style={{ marginTop: 16 }}>
-        Append-only. Records are added, never edited or deleted.
-      </p>
-
-      <Link to={`/pay/${txId}/status`}>
-        <button className="secondary">Back to result</button>
-      </Link>
+          <div className="mt-5 flex flex-wrap gap-2 max-md:flex-col">
+            <Button asChild variant="secondary" className="flex-1">
+              <Link to={`/pay/${txId}/status`}>Back to the result</Link>
+            </Button>
+            <Button asChild variant="secondary" className="flex-1">
+              <Link to="/home">Your account</Link>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
