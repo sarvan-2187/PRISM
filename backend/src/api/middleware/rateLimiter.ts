@@ -1,21 +1,39 @@
 import rateLimit from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import redis from '../../utils/redis';
+import { policy } from '../../config/policy';
 
 /**
- * API Gateway Rate Limiter
- * Backed by Redis for distributed enforcement across restarts.
+ * Rate limiting, enforced at the single API entrance.
+ *
+ * Two tiers, because the threat differs. The strict one guards anything an
+ * attacker would guess at — the two-digit semantic answer above all. Without
+ * it, a 3-attempt cap on one challenge means nothing if you can request a
+ * thousand challenges.
  */
-export const rateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  store: new RedisStore({
-    // @ts-expect-error — ioredis compatible
-    sendCommand: (...args: string[]) => redis.call(...args),
-  }),
-  message: {
-    error: 'Too many requests. Please try again later.',
-  },
-});
+function limiter(windowMs: number, max: number, prefix: string) {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    store: new RedisStore({
+      prefix: `rl:${prefix}:`,
+      sendCommand: ((...args: string[]) =>
+        redis.call(...(args as [string, ...string[]]))) as never,
+    }),
+    message: { failureCode: 'RATE_LIMITED', message: 'Too many requests. Please slow down.' },
+  });
+}
+
+export const defaultLimiter = limiter(
+  policy.rateLimit.defaultWindowMs,
+  policy.rateLimit.defaultMax,
+  'default'
+);
+
+export const strictLimiter = limiter(
+  policy.rateLimit.strictWindowMs,
+  policy.rateLimit.strictMax,
+  'strict'
+);

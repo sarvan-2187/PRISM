@@ -1,106 +1,164 @@
 /**
- * Typed API Client for the PRISM backend.
- * All methods map 1:1 to backend routes in /api/v1.
+ * Typed client for the PRISM backend.
+ *
+ * Two rules this file exists to enforce:
+ *  1. `credentials: 'include'` on every call — the session lives in an
+ *     httpOnly cookie, and no user id is ever sent in a body.
+ *  2. Every failure surfaces as an ApiError carrying the server's
+ *     `failureCode`, so the UI switches on the documented catalogue instead
+ *     of parsing prose.
  */
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}/api/v1${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    ...options,
-  });
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error ?? `HTTP ${res.status}`);
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly failureCode: string,
+    message: string,
+    public readonly details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ApiError';
   }
-  return res.json();
 }
 
-export const apiClient = {
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${API_URL}/api/v1${path}`, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
 
-  // ── Identity ──────────────────────────────────────────────
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      body.failureCode ?? 'UNKNOWN',
+      body.message ?? `HTTP ${res.status}`,
+      body.details
+    );
+  }
+  return body as T;
+}
 
-  async getRegistrationOptions(userId: string, email: string): Promise<any> {
-    return request('/auth/register/options', {
+// ── Shapes the server actually returns ────────────────────────────────
+
+export interface TransactionView {
+  txId: string;
+  payeeName: string;
+  payeeHandle: string;
+  amountMinor: number;
+  amountFormatted: string;
+  currency: string;
+  status: string;
+  intentHash: string;
+  expiresAt: string;
+  secondsRemaining: number;
+  riskScore: number | null;
+  riskReasons: string[];
+  failureCode: string | null;
+}
+
+export interface Payee {
+  accountId: string;
+  displayName: string;
+  handle: string;
+  knownPayee: boolean;
+}
+
+export interface StepUpChallenge {
+  token: string;
+  prompt: string;
+  payeeName: string;
+  amountFormatted: string;
+  expiresInSeconds: number;
+}
+
+export type AuthorizeResult =
+  | {
+      decision: 'APPROVED';
+      score: number;
+      reasons: string[];
+      settledAt: string;
+      balanceMinor: number;
+      balanceFormatted: string;
+    }
+  | { decision: 'STEP_UP'; score: number; reasons: string[]; challenge: StepUpChallenge };
+
+export const api = {
+  // Identity
+  registerOptions: (email: string) =>
+    request<never>('/auth/register/options', { method: 'POST', body: JSON.stringify({ email }) }),
+  registerVerify: (email: string, response: unknown) =>
+    request<{ userId: string; displayName: string }>('/auth/register/verify', {
       method: 'POST',
-      body: JSON.stringify({ userId, email }),
-    });
-  },
-
-  async submitRegistration(userId: string, response: any): Promise<void> {
-    return request('/auth/register/verify', {
+      body: JSON.stringify({ email, response }),
+    }),
+  loginOptions: (email: string) =>
+    request<never>('/auth/login/options', { method: 'POST', body: JSON.stringify({ email }) }),
+  loginVerify: (email: string, response: unknown) =>
+    request<{ userId: string; displayName: string }>('/auth/login/verify', {
       method: 'POST',
-      body: JSON.stringify({ userId, response }),
-    });
-  },
+      body: JSON.stringify({ email, response }),
+    }),
+  logout: () => request<{ ok: true }>('/auth/logout', { method: 'POST' }),
+  me: () =>
+    request<{
+      userId: string;
+      email: string;
+      displayName: string;
+      balanceMinor: number;
+      balanceFormatted: string;
+    }>('/me'),
 
-  async getAuthenticationOptions(userId: string, intentHash: string): Promise<any> {
-    return request('/auth/login/options', {
+  // Payment
+  payees: () => request<Payee[]>('/payees'),
+  initiate: (payeeAccountId: string, amountMinor: number) =>
+    request<TransactionView>('/payment/initiate', {
       method: 'POST',
-      body: JSON.stringify({ userId, intentHash }),
-    });
-  },
-
-  async submitAuthentication(userId: string, response: any, transactionId: string): Promise<any> {
-    return request('/auth/login/verify', {
+      body: JSON.stringify({ payeeAccountId, amountMinor }),
+    }),
+  /** Server-authoritative details. The review screen renders ONLY this. */
+  payment: (txId: string) => request<TransactionView>(`/payment/${txId}`),
+  challenge: (txId: string) => request<never>(`/payment/${txId}/challenge`, { method: 'POST' }),
+  authorize: (txId: string, assertion: unknown, deliberationMs: number) =>
+    request<AuthorizeResult>(`/payment/${txId}/authorize`, {
       method: 'POST',
-      body: JSON.stringify({ userId, response, transactionId }),
-    });
-  },
-
-  // ── Payment ───────────────────────────────────────────────
-
-  async initiatePayment(data: {
-    userId: string;
-    recipientId: string;
-    amount: number;
-    currency?: string;
-  }): Promise<{ transactionId: string; nonce: string; intentHash: string; expiresAt: string }> {
-    return request('/payment/initiate', {
+      body: JSON.stringify({ assertion, deliberationMs }),
+    }),
+  stepUp: (txId: string, answer: string) =>
+    request<{ ok: true; next: 'REAUTHORIZE' }>(`/payment/${txId}/step-up`, {
       method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
+      body: JSON.stringify({ answer }),
+    }),
 
-  async authorizePayment(transactionId: string, webauthnResponse: any): Promise<{
-    status: 'APPROVED' | 'BLOCKED' | 'STEP_UP_REQUIRED';
-    stepUpToken?: string;
-    challengeText?: string;
-  }> {
-    return request('/payment/authorize', {
-      method: 'POST',
-      body: JSON.stringify({ transactionId, webauthnResponse }),
-    });
-  },
+  // QR
+  qr: (txId: string) => request<{ token: string; expiresInSeconds: number }>(`/qr/${txId}`),
+  redeemQr: (token: string) =>
+    request<TransactionView>('/qr/redeem', { method: 'POST', body: JSON.stringify({ token }) }),
 
-  // ── QR ────────────────────────────────────────────────────
+  // Audit
+  timeline: (txId: string) =>
+    request<{
+      transaction: TransactionView;
+      events: { at: string; event: string; data: Record<string, unknown> }[];
+    }>(`/transactions/${txId}/timeline`),
+  history: () => request<TransactionView[]>('/transactions'),
 
-  async generateQR(transactionId: string): Promise<string> {
-    const data = await request<{ payload: string }>(`/qr/generate?transactionId=${transactionId}`);
-    return data.payload;
-  },
+  // Devices
+  credentials: () =>
+    request<{ id: string; deviceType: string; createdAt: string; lastUsedAt: string | null }[]>(
+      '/credentials'
+    ),
+  revoke: (id: string) => request<{ ok: true }>(`/credentials/${id}/revoke`, { method: 'POST' }),
 
-  // ── Step-Up ───────────────────────────────────────────────
-
-  async submitStepUp(data: {
-    transactionId: string;
-    userConfirmation: string;
-    stepUpToken: string;
-  }): Promise<{ approved: boolean }> {
-    return request('/verify/step-up', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
-
-  // ── Status ────────────────────────────────────────────────
-
-  async getTransactionStatus(transactionId: string): Promise<{
-    status: string;
-    riskScore?: number;
-  }> {
-    return request(`/transactions/${transactionId}`);
-  },
+  policy: () =>
+    request<{
+      intentTtlSeconds: number;
+      qrTtlSeconds: number;
+      stepUpMaxAttempts: number;
+      riskThresholds: { stepUpThreshold: number; blockThreshold: number };
+      disabledControls: string[];
+    }>('/policy'),
 };

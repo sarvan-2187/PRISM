@@ -1,76 +1,162 @@
 /**
- * Intent-Lock Module
- * Freezes transaction details into a nonce + expiry + SHA-256 hash
- * that becomes the WebAuthn challenge — binding the user's signature
- * to one exact payment, preventing QR manipulation & replay.
+ * Intent-Lock Module — the heart of PRISM.
  *
- * PRISM Flow Stage: Transaction binding (Layer 3 of 4-layer binding)
+ * Freezes a transaction into an immutable record, hashes it, and hands back
+ * a hash that becomes the WebAuthn challenge. That single move converts a
+ * signature meaning "I am Asha" into one meaning "I, Asha, approve exactly
+ * ₹5,000 to exactly Priya, in transaction txn_91f".
+ *
+ * Nothing in the hashed set is ever UPDATEd. Changing an amount does not edit
+ * a transaction — it creates a new one with a new id, nonce and hash, which is
+ * precisely why a captured assertion cannot be replayed against altered
+ * details.
  */
+import crypto from 'crypto';
 import { query } from '../../db/pool';
-import { TransactionRow } from '../../db/types';
 import redis from '../../utils/redis';
-import { generateNonce, sha256, safeCompare } from '../../utils/crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { generateNonce } from '../../utils/crypto';
+import { intentHash, hashesMatch, LockedIntent } from '../../utils/canonical';
+import { policy, isDisabled } from '../../config/policy';
+import { TransactionRow } from '../../db/types';
+import { audit } from '../audit/logger';
+import { PrismError } from '../../api/errors';
 
-export interface TransactionIntent {
-  userId: string;
-  recipientId: string;
-  amount: number;
-  currency: string;
+export interface LockRequest {
+  payerUserId: string;
+  payerAccountId: string;
+  payeeAccountId: string;
+  amountMinor: number;
 }
 
-export interface IntentLockResult {
-  transactionId: string;
-  nonce: string;
+export interface LockResult {
+  txId: string;
   intentHash: string;
   expiresAt: Date;
 }
 
-const INTENT_TTL_SECONDS = 300; // 5 minutes
+/** Nonce lifecycle states. Stored in Redis, distinct so failures stay distinct. */
+export type NonceState = 'RESERVED' | 'CONSUMED';
+
+const nonceKey = (nonce: string) => `nonce:${nonce}`;
 
 export class IntentLockModule {
-
   /**
-   * STAGE: Intent Freeze
-   * Creates the transaction record and computes the cryptographic binding hash.
-   * The intentHash becomes the WebAuthn challenge — meaning the user's device
-   * physically signs this exact transaction fingerprint.
+   * Freeze the intent. The nonce is deliberately NOT returned to the client:
+   * it has no client-side use, and handing it out only invites experiments.
    */
-  async lockIntent(intent: TransactionIntent): Promise<IntentLockResult> {
-    const transactionId = uuidv4();
+  async lock(req: LockRequest): Promise<LockResult> {
+    if (!Number.isInteger(req.amountMinor) || req.amountMinor <= 0) {
+      throw new PrismError(400, 'INVALID_AMOUNT', 'Amount must be a positive integer in paise.');
+    }
+
+    const txId = crypto.randomUUID();
     const nonce = generateNonce();
-    const expiresAt = new Date(Date.now() + INTENT_TTL_SECONDS * 1000);
+    const createdAt = Math.floor(Date.now() / 1000);
+    const expiresAt = createdAt + policy.intentTtlSeconds;
 
-    // TODO: 1. Construct hash input: `{userId}|{recipientId}|{amount}|{currency}|{nonce}|{expiresAt.toISOString()}`
-    // TODO: 2. intentHash = sha256(hashInput)
-    // TODO: 3. INSERT INTO transactions (id, user_id, recipient_id, amount, currency, intent_hash, nonce, expires_at, status)
-    //          VALUES (transactionId, ..., 'PENDING')
-    // TODO: 4. SETEX `nonce:{nonce}` {INTENT_TTL_SECONDS} "reserved" in Redis  ← replay prevention
-    // TODO: 5. Return { transactionId, nonce, intentHash, expiresAt }
-    throw new Error('Not implemented');
+    const intent: LockedIntent = {
+      amountMinor: req.amountMinor,
+      createdAt,
+      currency: policy.currency,
+      expiresAt,
+      lockVersion: 1,
+      nonce,
+      payeeAccountId: req.payeeAccountId,
+      payerUserId: req.payerUserId,
+      txId,
+    };
+    const hash = intentHash(intent);
+
+    await query(
+      `INSERT INTO transactions
+         (id, payer_user_id, payer_account_id, payee_account_id, amount_minor,
+          currency, intent_hash, nonce, lock_version, created_at, expires_at, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING')`,
+      [
+        txId,
+        req.payerUserId,
+        req.payerAccountId,
+        req.payeeAccountId,
+        req.amountMinor,
+        policy.currency,
+        hash,
+        nonce,
+        createdAt,
+        expiresAt,
+      ]
+    );
+
+    // Replay defence layer 1. RESERVED now, CONSUMED at settlement — never
+    // deleted, because a missing key is indistinguishable from an expired one
+    // and the failure catalogue needs REPLAY_BLOCKED separate from
+    // INTENT_EXPIRED.
+    await redis.set(nonceKey(nonce), 'RESERVED', 'EX', policy.nonceTtlSeconds);
+
+    await audit.log('INTENT_LOCKED', {
+      transactionId: txId,
+      userId: req.payerUserId,
+      data: { amountMinor: req.amountMinor, payeeAccountId: req.payeeAccountId, intentHash: hash },
+    });
+
+    return { txId, intentHash: hash, expiresAt: new Date(expiresAt * 1000) };
+  }
+
+  /** Load a transaction, or 404. */
+  async get(txId: string): Promise<TransactionRow> {
+    const { rows } = await query<TransactionRow>('SELECT * FROM transactions WHERE id = $1', [txId]);
+    if (!rows[0]) throw new PrismError(404, 'NOT_FOUND', 'No such transaction.');
+    return rows[0];
   }
 
   /**
-   * STAGE: Intent Verification (called during payment/authorize pipeline)
-   * Reconstructs the hash from DB data and compares to submitted intentHash.
-   * Also checks expiry and nonce replay status.
+   * Recompute the hash from what the database actually holds and compare it
+   * against the value the client is asking us to honour.
+   *
+   * This is the check that catches transaction tampering: the attacker holds a
+   * genuine signature over the original hash, but the record they want settled
+   * hashes to something else.
    */
-  async verifyIntentHash(intentHash: string, transactionId: string): Promise<boolean> {
-    // TODO: 1. SELECT * FROM transactions WHERE id = transactionId
-    // TODO: 2. Check row.expires_at > NOW() — throw 410 if expired, UPDATE status='EXPIRED'
-    // TODO: 3. Check Redis `nonce:{row.nonce}` still exists — throw 409 if replayed
-    // TODO: 4. Reconstruct hash from stored fields using sha256()
-    // TODO: 5. safeCompare(reconstructedHash, intentHash) — timing-safe
-    // TODO: 6. Return true only if hash matches and all checks pass
-    throw new Error('Not implemented');
+  verifyHash(tx: TransactionRow, claimedHash: string): boolean {
+    if (isDisabled('intentLock')) return true; // demo-only; see policy.ts
+
+    const recomputed = intentHash({
+      amountMinor: parseInt(tx.amount_minor, 10),
+      createdAt: Math.floor(tx.created_at.getTime() / 1000),
+      currency: tx.currency,
+      expiresAt: Math.floor(tx.expires_at.getTime() / 1000),
+      lockVersion: tx.lock_version,
+      nonce: tx.nonce,
+      payeeAccountId: tx.payee_account_id,
+      payerUserId: tx.payer_user_id,
+      txId: tx.id,
+    });
+    return hashesMatch(recomputed, tx.intent_hash) && hashesMatch(recomputed, claimedHash);
   }
 
-  /**
-   * Mark the nonce as consumed in Redis after a successful authorization.
-   * Called exactly once — subsequent calls will find no key (replay detection).
-   */
+  /** Has the 90-second window closed? */
+  isExpired(tx: TransactionRow): boolean {
+    if (isDisabled('expiryGuard')) return false;
+    return tx.expires_at.getTime() <= Date.now();
+  }
+
+  async nonceState(nonce: string): Promise<NonceState | null> {
+    if (isDisabled('replayGuard')) return 'RESERVED';
+    return (await redis.get(nonceKey(nonce))) as NonceState | null;
+  }
+
+  /** Called exactly once, at settlement. Marked, never deleted. */
   async consumeNonce(nonce: string): Promise<void> {
-    // TODO: DEL `nonce:{nonce}` from Redis
-    throw new Error('Not implemented');
+    await redis.set(nonceKey(nonce), 'CONSUMED', 'EX', policy.nonceTtlSeconds);
+  }
+
+  /** Record a terminal refusal against the transaction. */
+  async markFailed(txId: string, failureCode: string, status: 'BLOCKED' | 'EXPIRED'): Promise<void> {
+    await query('UPDATE transactions SET status = $2, failure_code = $3 WHERE id = $1', [
+      txId,
+      status,
+      failureCode,
+    ]);
   }
 }
+
+export const intentLock = new IntentLockModule();

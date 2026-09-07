@@ -1,48 +1,85 @@
 /**
- * Dynamic QR Module
- * Generates and verifies signed, single-use, time-limited QR codes.
- * The QR payload contains ONLY a signed transaction reference — never payment details.
+ * Dynamic QR Module — sign + verify.
  *
- * PRISM Flow Stage: QR initiation (before intent lock, or as entry point for QR-based flow)
+ * A static QR is a bearer instrument printed on paper: whoever prints it
+ * controls it. PRISM demotes the QR from a source of truth to an authenticated
+ * pointer. The token carries a transaction reference and nothing else — no
+ * amount, no payee — so even a perfectly valid QR cannot lie about the money.
+ * The client fetches the real details from the server using the reference.
+ *
+ * Consequences, which are the whole QR-swap defence:
+ *   - an unsigned printed sticker fails signature verification instantly
+ *   - a screenshot expires within 60 seconds
+ *   - a valid QR for someone else's transaction still displays that
+ *     transaction's real payee, so the user sees who they are actually paying
  */
-import { KeyManagementModule } from '../keys/keyManager';
+import crypto from 'crypto';
 import redis from '../../utils/redis';
-import { generateNonce } from '../../utils/crypto';
+import { keyManager } from '../keys/keyManager';
+import { policy, isDisabled } from '../../config/policy';
+import { audit } from '../audit/logger';
+import { fail } from '../../api/errors';
 
-export interface QRData {
-  transactionRef: string;
-  merchantId: string;
+const jtiKey = (jti: string) => `qr:${jti}`;
+
+export interface QrPayload {
+  /** Payload version, so the format can change without breaking verifiers. */
+  v: number;
+  /** Transaction reference — the only thing the QR actually carries. */
+  tx: string;
+  /** Intent hash, so a tampered pointer is detectable before any fetch. */
+  ih: string;
+  jti: string;
 }
-
-const QR_TTL_SECONDS = 60; // QR codes expire in 60 seconds
-
-const keyManager = new KeyManagementModule();
 
 export class DynamicQrModule {
-
-  /**
-   * STAGE: QR Generation
-   * Signs a short-lived JWT containing only transactionRef.
-   * Payment details are NEVER embedded in the QR.
-   */
-  async generateSignedQR(data: QRData): Promise<string> {
-    // TODO: 1. Build payload: { transactionRef, merchantId, jti: generateNonce(), exp: now + 60s }
-    // TODO: 2. signedToken = await keyManager.signPayload(payload, 'QR')
-    // TODO: 3. SETEX `qr:used:{jti}` {QR_TTL_SECONDS} "pending" in Redis (single-use tracking)
-    // TODO: 4. Return signedToken (client encodes this into QR image)
-    throw new Error('Not implemented');
+  async issue(txId: string, intentHash: string): Promise<{ token: string; expiresInSeconds: number }> {
+    const jti = crypto.randomBytes(16).toString('base64url');
+    const token = await keyManager.signQrToken(
+      { v: 1, tx: txId, ih: intentHash, jti } satisfies QrPayload,
+      policy.qrTtlSeconds
+    );
+    await redis.set(jtiKey(jti), 'ISSUED', 'EX', policy.qrTtlSeconds);
+    await audit.log('QR_ISSUED', { transactionId: txId, data: { jti } });
+    return { token, expiresInSeconds: policy.qrTtlSeconds };
   }
 
   /**
-   * STAGE: QR Verification (on scan)
-   * Verifies signature, expiry, and single-use status.
+   * Verify a scanned token: real signature, not expired, not already used.
+   * jose's errors are translated into the failure catalogue so the client and
+   * the attack scripts see a documented code rather than a library message.
    */
-  async verifyQR(signedPayload: string): Promise<QRData> {
-    // TODO: 1. decoded = await keyManager.verifySignature(signedPayload, 'QR')
-    // TODO: 2. Check decoded.exp > now (expiry)
-    // TODO: 3. GET `qr:used:{decoded.jti}` from Redis — throw 409 if already consumed
-    // TODO: 4. SET `qr:used:{decoded.jti}` "consumed" EX {QR_TTL_SECONDS} (mark as used)
-    // TODO: 5. Return { transactionRef: decoded.transactionRef, merchantId: decoded.merchantId }
-    throw new Error('Not implemented');
+  async redeem(token: string): Promise<QrPayload> {
+    if (isDisabled('qrSignature')) {
+      // Demo-only: decode without verifying, to show what an unsigned sticker
+      // would do to a system that trusts its QR codes.
+      const body = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString());
+      return body as QrPayload;
+    }
+
+    let payload;
+    try {
+      payload = await keyManager.verifyQrToken(token);
+    } catch (err) {
+      const message = (err as Error).message;
+      if (/exp|expired/i.test(message)) fail('QR_EXPIRED', { reason: message });
+      fail('QR_INVALID_SIGNATURE', { reason: message });
+    }
+
+    const { v, tx, ih, jti } = payload as unknown as QrPayload;
+    if (v !== 1 || !tx || !ih || !jti) fail('QR_INVALID_SIGNATURE', { reason: 'malformed payload' });
+
+    // Single use, claimed atomically: GETSET returns the previous value and
+    // installs CONSUMED in one round trip, so two simultaneous scans cannot
+    // both see ISSUED.
+    const previous = await redis.getset(jtiKey(jti), 'CONSUMED');
+    await redis.expire(jtiKey(jti), policy.qrTtlSeconds);
+    if (previous === null) fail('QR_EXPIRED', { reason: 'token unknown or expired' });
+    if (previous === 'CONSUMED') fail('QR_ALREADY_USED', { reason: 'token already redeemed' });
+
+    await audit.log('QR_REDEEMED', { transactionId: tx, data: { jti } });
+    return { v, tx, ih, jti };
   }
 }
+
+export const dynamicQr = new DynamicQrModule();

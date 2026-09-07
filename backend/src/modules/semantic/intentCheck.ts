@@ -1,53 +1,103 @@
 /**
- * Semantic Verification Module
- * Triggered by the Risk Engine on STEP_UP decisions.
- * Presents an additional intent-confirmation challenge to the user,
- * ensuring they understand exactly what they are approving.
+ * Semantic Verification Module.
  *
- * PRISM Flow Stage: Semantic check (triggered post Risk Engine on high-risk txns)
+ * Every other module asks "is this the right person, on the right device,
+ * approving the right transaction?" In social-engineering fraud the answer to
+ * all three is yes and the money is still stolen. This module is the only one
+ * that asks a different question: does the user actually understand what they
+ * are about to do?
+ *
+ * The challenge — type the last two digits of the amount — is deliberately
+ * not another biometric prompt. A thumb can be pressed reflexively while a
+ * scammer talks. Reading and typing the real number cannot.
+ *
+ * Honest limitation, stated in the README too: a sufficiently pressured victim
+ * may still type the digits. This adds friction and clarity at the decisive
+ * moment; it is not a cure.
  */
-import { query } from '../../db/pool';
-import { AuditModule } from '../audit/logger';
+import crypto from 'crypto';
+import redis from '../../utils/redis';
+import { policy } from '../../config/policy';
+import { audit } from '../audit/logger';
+import { fail } from '../../api/errors';
+import { TransactionRow, formatMinor } from '../../db/types';
 
-export interface StepUpChallenge {
-  transactionId: string;
-  challengeText: string; // e.g. "Confirm transfer of $500 to ACCT-4321"
-  expiresAt: Date;
+interface StepUpRecord {
+  expected: string;
+  intentHash: string;
+  attempts: number;
 }
 
-export interface StepUpVerification {
-  transactionId: string;
-  userConfirmation: string; // User's typed/spoken confirmation
-  stepUpToken: string;      // One-time token issued with STEP_UP response
+const key = (txId: string) => `stepup:${txId}`;
+
+export interface StepUpChallenge {
+  token: string;
+  prompt: string;
+  payeeName: string;
+  amountFormatted: string;
+  expiresInSeconds: number;
 }
 
 export class SemanticModule {
+  /** Build the challenge from the LOCKED record — never from client input. */
+  async issue(tx: TransactionRow, payeeName: string): Promise<StepUpChallenge> {
+    const amountMinor = parseInt(tx.amount_minor, 10);
+    const expected = String(Math.floor(amountMinor / 100) % 100).padStart(2, '0');
+    const token = crypto.randomBytes(24).toString('base64url');
 
-  /**
-   * STAGE: Step-Up Challenge Generation
-   * Creates a human-readable confirmation challenge for the user.
-   * Challenge text is derived from locked transaction details (not user input).
-   */
-  async generateChallenge(transactionId: string): Promise<StepUpChallenge> {
-    // TODO: 1. SELECT * FROM transactions WHERE id = transactionId
-    // TODO: 2. Build challengeText from DB row (amount, recipientId, currency) — never from req body
-    // TODO: 3. Generate stepUpToken and store in Redis (TTL 10min)
-    // TODO: 4. Return StepUpChallenge
-    throw new Error('Not implemented');
+    const record: StepUpRecord = { expected, intentHash: tx.intent_hash, attempts: 0 };
+    await redis.set(key(tx.id), JSON.stringify(record), 'EX', policy.stepUp.ttlSeconds);
+
+    await audit.log('STEP_UP_ISSUED', { transactionId: tx.id, userId: tx.payer_user_id });
+
+    return {
+      token,
+      payeeName,
+      amountFormatted: formatMinor(tx.amount_minor, tx.currency),
+      prompt: `Enter the last two digits of the amount you intend to send.`,
+      expiresInSeconds: policy.stepUp.ttlSeconds,
+    };
   }
 
   /**
-   * STAGE: Step-Up Confirmation
-   * Verifies user's confirmation matches locked transaction intent.
-   * On success, transitions transaction to APPROVED for ledger settlement.
+   * Check the answer. Single-use, short-lived, and capped at 3 attempts —
+   * without the cap a two-digit answer is brute-forceable in 100 tries, which
+   * is the first thing a judge will ask about.
    */
-  async confirmIntent(verification: StepUpVerification): Promise<{ approved: boolean }> {
-    // TODO: 1. Verify stepUpToken from Redis (single-use)
-    // TODO: 2. SELECT transaction and reconstruct expected confirmation text
-    // TODO: 3. Compare userConfirmation against expected (semantic match, not exact string)
-    // TODO: 4. If match → UPDATE transactions SET status='APPROVED'
-    // TODO: 5. Log SEMANTIC_VERIFIED event via AuditModule
-    // TODO: 6. Return { approved: true/false }
-    throw new Error('Not implemented');
+  async verify(tx: TransactionRow, answer: string): Promise<void> {
+    const raw = await redis.get(key(tx.id));
+    if (!raw) fail('STEP_UP_FAILED', { reason: 'challenge expired' });
+
+    const record = JSON.parse(raw) as StepUpRecord;
+
+    // The challenge is bound to the intent: re-locking the transaction
+    // invalidates an outstanding challenge.
+    if (record.intentHash !== tx.intent_hash) {
+      await redis.del(key(tx.id));
+      fail('TAMPER_BLOCKED', { reason: 'challenge bound to a different intent' });
+    }
+
+    if (answer.trim() !== record.expected) {
+      record.attempts += 1;
+      const exhausted = record.attempts >= policy.stepUp.maxAttempts;
+      if (exhausted) {
+        await redis.del(key(tx.id));
+      } else {
+        await redis.set(key(tx.id), JSON.stringify(record), 'EX', policy.stepUp.ttlSeconds);
+      }
+      await audit.log('STEP_UP_FAILED', {
+        transactionId: tx.id,
+        userId: tx.payer_user_id,
+        data: { attempts: record.attempts, exhausted },
+      });
+      fail('STEP_UP_FAILED', {
+        attemptsRemaining: Math.max(0, policy.stepUp.maxAttempts - record.attempts),
+      });
+    }
+
+    await redis.del(key(tx.id)); // single-use
+    await audit.log('STEP_UP_PASSED', { transactionId: tx.id, userId: tx.payer_user_id });
   }
 }
+
+export const semantic = new SemanticModule();

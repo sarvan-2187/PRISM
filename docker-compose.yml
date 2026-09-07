@@ -1,4 +1,11 @@
-version: '3.8'
+# Data stores only.
+#
+# The backend and frontend run on the host with `npm run dev` rather than in
+# containers: WebAuthn is bound to a hostname, and keeping the app on
+# localhost avoids invalidating every registered passkey the moment someone
+# changes how it is served. There are deliberately no Dockerfiles here.
+#
+#   docker compose up -d
 
 services:
   postgres:
@@ -8,39 +15,26 @@ services:
       POSTGRES_PASSWORD: prism_password
       POSTGRES_DB: prism_db
     ports:
-      - "5432:5432"
+      - '5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U prism_user -d prism_db']
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - '6379:6379'
     volumes:
       - redisdata:/data
-
-  backend:
-    build:
-      context: ./backend
-    environment:
-      - DATABASE_URL=postgresql://prism_user:prism_password@postgres:5432/prism_db
-      - REDIS_URL=redis://redis:6379
-      - PORT=4000
-    ports:
-      - "4000:4000"
-    depends_on:
-      - postgres
-      - redis
-
-  frontend:
-    build:
-      context: ./frontend
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:4000
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:

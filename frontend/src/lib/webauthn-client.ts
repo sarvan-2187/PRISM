@@ -1,36 +1,49 @@
 /**
- * Client-side WebAuthn handling using @simplewebauthn/browser.
- * The intentHash MUST be passed as the challenge for authentication
- * to cryptographically bind the passkey signature to the transaction.
+ * WebAuthn browser wrapper.
+ *
+ * The important thing this file does NOT do: compute or re-encode a challenge.
+ * The server sends options whose `challenge` is already the intent hash in
+ * base64url, and they are passed to the authenticator untouched. Every bug in
+ * this area comes from something helpfully re-encoding on the way through.
  */
 import {
   startRegistration,
   startAuthentication,
-  type PublicKeyCredentialCreationOptionsJSON,
-  type PublicKeyCredentialRequestOptionsJSON,
+  browserSupportsWebAuthn,
+  platformAuthenticatorIsAvailable,
 } from '@simplewebauthn/browser';
+// Derive the option types from the functions themselves rather than importing
+// them: @simplewebauthn moves these between packages across versions, and this
+// spelling cannot drift out of sync with the installed one.
+type RegistrationOptions = Parameters<typeof startRegistration>[0];
+type AuthenticationOptions = Parameters<typeof startAuthentication>[0];
 
-export const webauthnClient = {
+export const webauthn = {
+  supported: () => browserSupportsWebAuthn(),
+
+  /** True when the device has a built-in authenticator (Touch ID, Windows Hello). */
+  platformAvailable: () => platformAuthenticatorIsAvailable(),
+
+  register: (options: RegistrationOptions) => startRegistration(options),
 
   /**
-   * Trigger the device passkey registration flow.
-   * @param options - Options object from /auth/register/options
+   * Approve a payment. `options.challenge` is the intent hash — the signature
+   * that comes back is over this exact transaction and is void for any other.
    */
-  async register(options: PublicKeyCredentialCreationOptionsJSON): Promise<any> {
-    // TODO: return await startRegistration(options)
-    // Returns the credential response to send to /auth/register/verify
-    throw new Error('Not implemented');
-  },
-
-  /**
-   * Trigger the device passkey authentication flow.
-   * The options.challenge MUST be the intentHash from IntentLock —
-   * this is what makes the user's signature specific to this transaction.
-   * @param options - Options object from /auth/login/options (challenge = intentHash)
-   */
-  async authenticate(options: PublicKeyCredentialRequestOptionsJSON): Promise<any> {
-    // TODO: return await startAuthentication(options)
-    // Returns the assertion response to send to /auth/login/verify
-    throw new Error('Not implemented');
-  },
+  approve: (options: AuthenticationOptions) => startAuthentication(options),
 };
+
+/** Turn a WebAuthn exception into something worth showing a user. */
+export function describeWebAuthnError(err: unknown): string {
+  const name = (err as { name?: string })?.name;
+  switch (name) {
+    case 'NotAllowedError':
+      return 'Approval was cancelled or timed out.';
+    case 'InvalidStateError':
+      return 'A passkey is already registered on this device.';
+    case 'SecurityError':
+      return 'This page is not a secure context. Use http://localhost or HTTPS.';
+    default:
+      return (err as Error)?.message ?? 'Passkey verification failed.';
+  }
+}

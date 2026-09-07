@@ -4,6 +4,58 @@
 
 ---
 
+## Run it
+
+Prerequisites: Node ≥ 20, Docker Desktop running.
+
+```bash
+cp .env.example .env
+# set JWT_SECRET:
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+
+docker compose up -d                       # postgres + redis only
+
+cd backend && npm install
+npm run db:migrate && npm run db:seed
+npm test                                   # pins the intent-hash contract
+npm run dev                                # :4000
+
+cd ../frontend && npm install && npm run dev   # :5173
+```
+
+Open <http://localhost:5173>, register a passkey as Asha, and pay.
+Health check: `curl localhost:4000/health`.
+
+> **Do not change the hostname or port after registering a passkey.** The
+> WebAuthn RP ID is bound to `localhost`, and every credential dies with it.
+
+## Current state (M0 complete)
+
+| Area | State |
+|---|---|
+| Postgres schema, migrations, seed | ✅ working |
+| Intent-hash contract + self-check | ✅ working, pinned by `npm test` |
+| Passkey register / login / session cookie | ✅ working |
+| Intent lock, nonce lifecycle, audit log | ✅ working |
+| Context, risk engine, semantic step-up, Ed25519 QR, ledger | ✅ implemented, needs end-to-end testing |
+| Frontend | ⚠️ Vite + React scaffold; sign-in works, payment screens are owned stubs |
+| Attack scripts | ⛔ not started (S3) |
+
+**Read [`PLAN.md`](PLAN.md) before starting.** It carries the task breakdown,
+file ownership, the git workflow, and the review checkpoints.
+API contract: [`docs/api-contract.md`](docs/api-contract.md) — frozen; ask S1
+before changing a route.
+
+Two rules that cause the most expensive bugs if broken:
+
+1. **Money is integer minor units (paise).** ₹5,000 is `500000`.
+2. **No endpoint takes a `userId`.** The payer comes from the session cookie.
+
+⚠️ Sections below this line still describe the original scaffold (Next.js,
+USD, the old folder layout) and are being rewritten — trust the table above.
+
+---
+
 ## What PRISM Prevents
 
 | Threat | PRISM Defence |
