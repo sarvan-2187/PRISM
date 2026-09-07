@@ -9,6 +9,7 @@
     "db:migrate": "ts-node src/db/migrate.ts",
     "db:seed": "ts-node src/db/seed.ts",
     "test": "ts-node src/utils/canonical.test.ts && ts-node src/modules/identity/challengeEncoding.test.ts",
+    "test:e2e": "ts-node src/modules/intent/payment.e2e.ts",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src/**/*.ts"
   },
