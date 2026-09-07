@@ -69,6 +69,32 @@ export function summarise(data: Record<string, unknown>): string[] {
   ];
   for (const [key, text] of flags) if (data[key] === true) out.push(text);
 
+  // Device + network detail, present only on CONTEXT_EVALUATED. These are the
+  // coarse, hashed values PRISM stored — shown so the "examined" step is
+  // legible, not just a claim. `deviceFingerprint` is the marker for the set.
+  if (typeof data.deviceFingerprint === 'string') {
+    out.push(`device fingerprint: ${data.deviceFingerprint}`);
+    if (typeof data.acceptLanguage === 'string' && data.acceptLanguage) {
+      out.push(`language: ${data.acceptLanguage}`);
+    }
+    if (typeof data.networkSubnet === 'string') {
+      const note =
+        data.networkPrivate === true ? ' (private — carries no network evidence)' : '';
+      out.push(`network: ${data.networkSubnet}${note}`);
+    }
+    if (typeof data.networkId === 'string') {
+      out.push(`network id: ${data.networkId}`);
+    }
+    if (typeof data.payerHistoryCount === 'number') {
+      const n = data.payerHistoryCount;
+      const usual =
+        typeof data.usualAmountMinor === 'number' && data.usualAmountMinor > 0
+          ? `, usual ~₹${Math.round(data.usualAmountMinor / 100).toLocaleString('en-IN')}`
+          : '';
+      out.push(`payer history: ${n} settled payment${n === 1 ? '' : 's'}${usual}`);
+    }
+  }
+
   if (typeof data.deliberationMs === 'number') {
     out.push(`considered for ${Math.round(data.deliberationMs / 100) / 10}s`);
   }

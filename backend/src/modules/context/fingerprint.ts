@@ -28,6 +28,7 @@ import {
   impossibleTravel,
   geoForIp,
   type GeoPoint,
+  type AddressFamily,
 } from './network';
 
 export interface ContextSnapshot {
@@ -37,6 +38,13 @@ export interface ContextSnapshot {
   networkId: string;
   /** Whether that subnet was loopback/RFC1918, i.e. carries no real evidence. */
   networkPrivate: boolean;
+  /**
+   * The coarse subnet in readable form, e.g. "192.168.1.0/24". For the audit
+   * trail and logs only — every decision compares the hashed networkId, never
+   * this. Already a /24 or /48, so it does not single out a host.
+   */
+  networkSubnet: string;
+  networkFamily: AddressFamily;
   acceptLanguage: string;
   credentialId: string | null;
   /**
@@ -122,6 +130,8 @@ export class ContextModule {
         .slice(0, 16),
       networkId: net.networkId,
       networkPrivate: net.isPrivate,
+      networkSubnet: net.subnet,
+      networkFamily: net.family,
       acceptLanguage: String(lang).slice(0, 32),
       credentialId: extra.credentialId ?? null,
       txId: (req.params?.id as string | undefined) ?? null,

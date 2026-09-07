@@ -350,7 +350,18 @@ router.post(
     await audit.log('CONTEXT_EVALUATED', {
       transactionId: tx.id,
       userId: req.userId,
-      data: { ...signals },
+      data: {
+        ...signals,
+        // The device and network PRISM actually examined, recorded the way it
+        // stored them: coarse, hashed, readable. Surfaced so the timeline's
+        // "examined" step shows what was examined rather than only asserting it.
+        deviceFingerprint: snapshot.deviceFingerprint,
+        acceptLanguage: snapshot.acceptLanguage,
+        networkId: snapshot.networkId,
+        networkSubnet: snapshot.networkSubnet,
+        networkFamily: snapshot.networkFamily,
+        networkPrivate: snapshot.networkPrivate,
+      },
     });
     await attestationChain.append(tx.id, 'CONTEXT_VERIFIED', { ...signals });
 
