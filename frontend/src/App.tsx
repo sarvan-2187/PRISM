@@ -36,9 +36,11 @@ import Receive from '@/pages/Receive';
 import Scan from '@/pages/Scan';
 import Profile from '@/pages/Profile';
 import Policy from '@/pages/Policy';
+import AttackDashboard from '@/pages/attacks/Dashboard';
+import AttackDetail from '@/pages/attacks/AttackDetail';
 
 /** Views that get the wide column. Everything else is the focused flow. */
-const WIDE = ['/home', '/profile', '/policy'];
+const WIDE = ['/home', '/profile', '/policy', '/attacks'];
 
 const NAV = [
   { to: '/home', label: 'Home' },
@@ -47,6 +49,7 @@ const NAV = [
   { to: '/scan', label: 'Scan' },
   { to: '/profile', label: 'Passkeys' },
   { to: '/policy', label: 'Policy' },
+  { to: '/attacks', label: 'Attack Sim' },
 ];
 
 /** Inner routes need a session. While it is being fetched, render nothing. */
@@ -65,7 +68,7 @@ function Shell() {
   const { pathname } = useLocation();
   const { me, signOut } = useSession();
 
-  const wide = WIDE.includes(pathname);
+  const wide = WIDE.includes(pathname) || pathname.startsWith('/attacks');
   // The landing hero runs edge to edge and under the header, so on that one
   // route the shell stops constraining and the header stops painting.
   const bleed = pathname === '/';
@@ -186,6 +189,12 @@ function Shell() {
           <Route path="/pay/:txId/timeline" element={guard(<Timeline />)} />
           <Route path="/receive" element={guard(<Receive />)} />
           <Route path="/scan" element={guard(<Scan />)} />
+          {/* Not behind guard(): the Attack Simulation Dashboard is gated by its own
+              operator token (ATTACK_ADMIN_TOKEN), independent of a PRISM user session —
+              the "attacker" and the operator running the demo need not be signed in as
+              any PRISM user at all. */}
+          <Route path="/attacks" element={<AttackDashboard />} />
+          <Route path="/attacks/:scenarioId" element={<AttackDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

@@ -24,11 +24,22 @@ export const config = {
   redisUrl: requireEnv('REDIS_URL'),
 
   // WebAuthn / FIDO2
-  webauthn: {
-    rpId: requireEnv('WEBAUTHN_RP_ID'),
-    rpName: requireEnv('WEBAUTHN_RP_NAME'),
-    expectedOrigin: requireEnv('WEBAUTHN_EXPECTED_ORIGIN'),
-  },
+  // WEBAUTHN_EXPECTED_ORIGIN may be a comma-separated list — e.g.
+  // "http://localhost:5173,https://prism.local:5173" — so a second, LAN-reachable
+  // HTTPS origin (see docs/LAN_DEMO_SETUP.md) can be trusted alongside localhost
+  // without any other code change. expectedOrigin (singular) stays the first
+  // entry, used wherever a single default origin is needed (e.g. the headless
+  // test authenticator); expectedOrigins (plural) is the full accepted list.
+  webauthn: (() => {
+    const raw = requireEnv('WEBAUTHN_EXPECTED_ORIGIN');
+    const expectedOrigins = raw.split(',').map((o) => o.trim()).filter(Boolean);
+    return {
+      rpId: requireEnv('WEBAUTHN_RP_ID'),
+      rpName: requireEnv('WEBAUTHN_RP_NAME'),
+      expectedOrigin: expectedOrigins[0],
+      expectedOrigins,
+    };
+  })(),
 
   // Key Management — read ONLY by KeyManagementModule, never by other modules.
   jwtSecret: requireEnv('JWT_SECRET'),
