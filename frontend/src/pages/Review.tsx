@@ -16,6 +16,7 @@ import { useNavigate, useParams, Link } from 'react-router-dom';
 import { api, ApiError, TransactionView } from '@/lib/api-client';
 import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
 import { LiveLog } from '@/components/LiveLog';
+import { usePoll } from '@/lib/usePoll';
 import { useSession } from '@/lib/session';
 import { isTerminal } from '@/lib/events';
 import { Button } from '@/components/ui/button';
@@ -62,6 +63,21 @@ export default function Review() {
     const t = setInterval(() => setRemaining((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(t);
   }, [remaining]);
+
+  // Observe-only: while this screen is waiting (not mid-approval itself), poll
+  // the server's own authoritative record. If something else acting on this
+  // exact transaction id — e.g. a demonstrated attack from the Live Attack
+  // Lab — causes the server to reach a terminal state, this screen notices
+  // and moves to Status, which renders whatever real reason PRISM recorded.
+  // This poll never makes a decision itself; it only reads one that already
+  // happened server-side.
+  usePoll(() => api.payment(txId), 1500, {
+    enabled: Boolean(tx) && !busy && !isTerminal(tx?.status ?? '') && remaining > 0,
+    onData: (fresh) => {
+      setTx(fresh);
+      if (isTerminal(fresh.status)) navigate(`/pay/${txId}/status`);
+    },
+  });
 
   async function approve() {
     setBusy(true);

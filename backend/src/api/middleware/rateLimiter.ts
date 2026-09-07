@@ -37,3 +37,10 @@ export const strictLimiter = limiter(
   policy.rateLimit.strictMax,
   'strict'
 );
+
+/**
+ * The Attack Simulation Dashboard fires many real requests per launched
+ * scenario (each attacker function makes several real API calls). It has its
+ * own budget so a demo session never starves the payment-path limiters above.
+ */
+export const attackLimiter = limiter(5 * 60 * 1000, 300, 'attacks');
