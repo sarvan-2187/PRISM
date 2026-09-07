@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { defaultLimiter, strictLimiter } from './middleware/rateLimiter';
 import { requireSession, issueSession, clearSession } from './middleware/session';
-import { fail, PrismError } from './errors';
+import { fail, PrismError, FAILURES, FailureCode } from './errors';
 import { query } from '../db/pool';
 import { AccountRow, TransactionRow, UserRow, formatMinor } from '../db/types';
 import { identity } from '../modules/identity/webauthn';
@@ -216,7 +216,24 @@ router.post(
     // 1. Ownership and state.
     if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
     if (tx.status === 'SETTLED') fail('REPLAY_BLOCKED');
-    if (tx.status === 'BLOCKED' || tx.status === 'EXPIRED') fail(tx.failure_code as 'RISK_BLOCKED');
+    if (tx.status === 'BLOCKED' || tx.status === 'EXPIRED') {
+      // Re-hitting a transaction that already failed terminally. Return the
+      // code it failed with — but only if it is a real catalogue entry, so a
+      // missing/unknown failure_code degrades to a sane code instead of
+      // throwing a 500 out of fail().
+      const code: FailureCode =
+        tx.failure_code && tx.failure_code in FAILURES
+          ? (tx.failure_code as FailureCode)
+          : tx.status === 'EXPIRED'
+            ? 'INTENT_EXPIRED'
+            : 'RISK_BLOCKED';
+      await audit.log('PAYMENT_BLOCKED', {
+        transactionId: tx.id,
+        userId: req.userId,
+        data: { failureCode: code, terminal: true },
+      });
+      fail(code);
+    }
 
     // 2. Expiry.
     if (intentLock.isExpired(tx)) {
