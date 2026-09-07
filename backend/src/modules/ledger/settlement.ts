@@ -59,8 +59,8 @@ export class SettlementModule {
         throw new PrismError(402, 'INSUFFICIENT_FUNDS', 'Insufficient balance.');
       }
 
-      await client.query(
-        'UPDATE accounts SET balance_minor = balance_minor - $2 WHERE id = $1',
+      const { rows: debited } = await client.query<{ balance_minor: string }>(
+        'UPDATE accounts SET balance_minor = balance_minor - $2 WHERE id = $1 RETURNING balance_minor',
         [tx.payer_account_id, amount]
       );
       await client.query(
@@ -83,20 +83,17 @@ export class SettlementModule {
 
       await client.query('COMMIT');
 
-      const { rows: after } = await client.query<{ balance_minor: string }>(
-        'SELECT balance_minor FROM accounts WHERE id = $1',
-        [tx.payer_account_id]
-      );
-
       await audit.log('PAYMENT_SETTLED', {
         transactionId: tx.id,
         userId: tx.payer_user_id,
         data: { amountMinor: amount },
       });
 
+      // Balance captured by the debit UPDATE above, inside the committed
+      // transaction — it is this payment's result, not a later concurrent state.
       return {
         settledAt: new Date(),
-        payerBalanceMinor: parseInt(after[0].balance_minor, 10),
+        payerBalanceMinor: parseInt(debited[0].balance_minor, 10),
       };
     } catch (err) {
       await client.query('ROLLBACK');
