@@ -14,9 +14,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, TransactionView } from '@/lib/api-client';
+import { api, ApiError, OfflineError, TransactionView } from '@/lib/api-client';
 import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
 import { useSession } from '@/lib/session';
+import { useOnline } from '@/lib/useOnline';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -29,6 +30,7 @@ export default function Verify() {
   const { txId = '' } = useParams();
   const navigate = useNavigate();
   const { refresh } = useSession();
+  const online = useOnline();
   const [tx, setTx] = useState<TransactionView | null>(null);
   const [answer, setAnswer] = useState('');
   const [attemptsLeft, setAttemptsLeft] = useState<number | null>(null);
@@ -71,6 +73,14 @@ export default function Verify() {
     void issueCode();
   }, [tx?.stepUpMode, issueCode]);
 
+  // The very first mint attempt landed while offline and silently failed —
+  // retry automatically the moment connectivity returns instead of leaving
+  // the QR stuck on "Preparing…" until the user notices and clicks Generate.
+  useEffect(() => {
+    if (tx?.stepUpMode === 'AUTHENTICATOR' && online && !token) void issueCode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [online]);
+
   // The 60-second window, counted down locally purely so the user can see it.
   // The server holds the authoritative record and refuses a stale code
   // regardless of what this clock says.
@@ -99,7 +109,13 @@ export default function Verify() {
       await refresh();
       navigate(`/pay/${txId}/status`);
     } catch (err) {
-      if (err instanceof ApiError) {
+      if (err instanceof OfflineError) {
+        // Never counts as a wrong answer and never touches attemptsLeft: the
+        // server never saw this attempt at all, so it cannot have consumed
+        // one of the three tries. Staying here lets the same code (or the
+        // same passkey step) be resubmitted once connectivity returns.
+        setError("You're offline. That attempt was not sent — reconnect and try again.");
+      } else if (err instanceof ApiError) {
         const left = (err.details as { attemptsRemaining?: number })?.attemptsRemaining;
         setAttemptsLeft(left ?? null);
         if (left === 0 || err.failureCode !== 'STEP_UP_FAILED') {
@@ -112,7 +128,7 @@ export default function Verify() {
           tx?.stepUpMode !== 'AUTHENTICATOR'
             ? 'That is not the right number.'
             : expiredCode
-              ? 'That code has expired. Generate a new one and scan it again.'
+              ? 'That code is only valid for 60 seconds and has expired. Generate a new one and scan it again — this is a freshness check, not a risk-score decision.'
               : 'That code does not match this payment.'
         );
         setAnswer('');
@@ -199,8 +215,8 @@ export default function Verify() {
                     Expires in {codeLeft}s
                   </p>
                 ) : (
-                  <Button variant="secondary" size="sm" onClick={issueCode}>
-                    Generate a new code
+                  <Button variant="secondary" size="sm" onClick={issueCode} disabled={!online}>
+                    {online ? 'Generate a new code' : "You're offline"}
                   </Button>
                 )}
               </div>
@@ -270,15 +286,17 @@ export default function Verify() {
             block
             className="mt-3"
             onClick={submit}
-            disabled={answer.length !== codeLength || busy || (byPhone && codeLeft <= 0)}
+            disabled={answer.length !== codeLength || busy || (byPhone && codeLeft <= 0) || !online}
           >
             {phase === 'checking'
               ? 'Checking the number…'
               : phase === 'signing'
                 ? 'Waiting for your passkey…'
-                : byPhone
-                  ? 'Confirm phone code'
-                  : 'Confirm and sign again'}
+                : !online
+                  ? "You're offline"
+                  : byPhone
+                    ? 'Confirm phone code'
+                    : 'Confirm and sign again'}
           </Button>
 
           <p className="mt-3 text-pretty text-small text-secondary-foreground">

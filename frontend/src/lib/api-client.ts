@@ -36,12 +36,41 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Distinct from ApiError on purpose: this never reached the server at all, so
+ * there is no failureCode to switch on and nothing to blame on WebAuthn or on
+ * PRISM's decision logic. Every call site that used to lump a network failure
+ * in with "passkey error" or "signed out" needs to check for this first.
+ */
+export class OfflineError extends Error {
+  constructor() {
+    super('You appear to be offline.');
+    this.name = 'OfflineError';
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${API_URL}/api/v1${path}`, {
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
+  // Fail fast and unambiguously instead of letting the browser's own retry/
+  // timeout behavior produce a slow, differently-worded error each time.
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new OfflineError();
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/api/v1${path}`, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+  } catch (err) {
+    // A fetch that never got a response (DNS failure, dropped connection,
+    // connectivity lost mid-flight) throws a plain TypeError in every
+    // browser. There is no failureCode to read because the server was never
+    // reached, so this is always an offline condition, not a PRISM decision.
+    if (err instanceof TypeError) throw new OfflineError();
+    throw err;
+  }
 
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
