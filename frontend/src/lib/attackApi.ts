@@ -59,7 +59,8 @@ export type ScenarioCategory =
   | 'Authorization / IDOR'
   | 'Identity (WebAuthn)'
   | 'Session Forgery'
-  | 'Social Engineering / Brute Force';
+  | 'Social Engineering / Brute Force'
+  | 'QR / Receiving Payments';
 
 export interface ScenarioDefinition {
   id: string;
@@ -136,6 +137,7 @@ export type PrismLayer =
   | 'AUTHORIZATION'
   | 'LEDGER'
   | 'NETWORK'
+  | 'QR'
   | 'NONE';
 
 export interface AttackRunEvent {

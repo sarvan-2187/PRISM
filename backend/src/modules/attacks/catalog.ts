@@ -16,7 +16,8 @@ export type ScenarioId =
   | 'IDOR_CROSS_USER'
   | 'FORGED_WEBAUTHN_ASSERTION'
   | 'SESSION_JWT_TAMPER'
-  | 'STEPUP_BRUTEFORCE';
+  | 'STEPUP_BRUTEFORCE'
+  | 'QR_OVERLAY_SWAP';
 
 export type ScenarioCategory =
   | 'Transaction Integrity'
@@ -24,7 +25,8 @@ export type ScenarioCategory =
   | 'Authorization / IDOR'
   | 'Identity (WebAuthn)'
   | 'Session Forgery'
-  | 'Social Engineering / Brute Force';
+  | 'Social Engineering / Brute Force'
+  | 'QR / Receiving Payments';
 
 export interface ScenarioDefinition {
   id: ScenarioId;
@@ -251,6 +253,44 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
       'This run needs the live risk engine to actually reach STEP_UP_REQUIRED for the amount/payee combination used; PRISM’s risk thresholds are policy-owned and can legitimately produce APPROVE or BLOCK instead on a given run — if so, this is reported honestly as SIMULATED rather than forcing a result.',
     ],
     limitations: ['A sufficiently pressured genuine victim reading the digits aloud to a scammer is a social problem this control reduces, not eliminates.'],
+  },
+
+  QR_OVERLAY_SWAP: {
+    id: 'QR_OVERLAY_SWAP',
+    name: 'QR Code Overlay (Sticker-Swap) Fraud',
+    category: 'QR / Receiving Payments',
+    severity: 'HIGH',
+    whatItIs:
+      'The classic UPI/QR sticker-swap scam: a fraudster pastes a look-alike code over a shop’s real one. A static QR just encodes an account number, so the swap is invisible — the customer scans, sees an ordinary-looking payment screen, and pays the fraudster with no warning. This reproduces the swap against PRISM’s Receive flow three ways: (1) the attacker’s own, honestly-signed request displayed in place of the merchant’s — no forgery needed, exactly like the real scam; (2) the same code photographed and scanned a second time; (3) a hand-crafted, unsigned code, the low-effort version of the same sticker.',
+    howItAffectsTheModel:
+      'PRISM’s QR is deliberately not a bearer instrument: the code carries a signed reference, never a name, an account number, or an amount (see dynamicQr.ts). If the overlay succeeded silently, the entire "receive" side of PRISM would be exactly as vulnerable as a static-QR wallet is today, no matter how strong the payer-side controls are.',
+    attackerGoal:
+      "Get a customer's device to resolve a scanned code to the attacker's own account while the customer believes they scanned the merchant's.",
+    expectedDetectionLayer: 'Dynamic QR (QR layer)',
+    expectedDetectionFiles: [
+      'backend/src/modules/qr/dynamicQr.ts (createRequest / scan / verifyToken)',
+      'backend/src/api/routes.ts (POST /qr/request, POST /qr/scan)',
+    ],
+    preconditions: [
+      'Two distinct real users exist — one plays the customer, a second plays the overlay attacker',
+      'PRISM backend reachable at the configured local URL',
+    ],
+    expectedOutcome:
+      'Sub-attack 1 is not rejected by the server at all — the attacker’s code is genuinely theirs and genuinely signed — but POST /qr/scan resolves it from the database and returns the attacker’s REAL name and handle, never a spoofed merchant identity, so the review screen a customer sees before approving names the true recipient. Sub-attack 2 (scanning the exact same code a second time) is refused with QR_ALREADY_USED. Sub-attack 3 (a hand-crafted, unsigned code) is refused with QR_INVALID_SIGNATURE before any database lookup happens.',
+    mechanism:
+      'The engine establishes two real, independent sessions — a customer and a separate overlay attacker. The attacker mints a real, validly-signed QR payment request for their own account (POST /qr/request) — this is "the sticker". The customer’s session then scans it once (POST /qr/scan); the engine inspects the resolved payeeName/payeeHandle in the real response against the attacker’s real identity. The engine then resubmits the identical, now-consumed token a second time (POST /qr/scan again), and separately submits a hand-built, unsigned token of the same shape — both as the customer.',
+    attackerDevice:
+      "A second, fully legitimate PRISM account displaying its OWN real QR code in place of a shop's — modelling a fraudster who needs no forged signature at all, only physical or digital access to overlay a genuine code of their own.",
+    targetDescription:
+      'Two real accounts: a customer (the target user) and a second real account the engine selects to play the overlay attacker.',
+    usesVictimSession: true,
+    usesAttackerSession: true,
+    assumptions: [
+      'The attacker can physically or digitally place their own QR code where a customer will scan it (e.g. a paper sticker, a compromised display) — this scenario does not test that placement step itself, only what happens once the customer’s device resolves the code.',
+    ],
+    limitations: [
+      'A customer who does not read the recipient name before approving is not protected by this control alone — PRISM exposes the true identity truthfully; a human still has to look at it. The same honest limitation the semantic step-up documents for social engineering applies here.',
+    ],
   },
 };
 

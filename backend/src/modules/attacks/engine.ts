@@ -22,6 +22,7 @@ import { idorCrossUser } from './attackers/idorCrossUser';
 import { forgedWebauthnAssertion } from './attackers/forgedWebauthnAssertion';
 import { sessionJwtTamper } from './attackers/sessionJwtTamper';
 import { stepUpBruteforce } from './attackers/stepUpBruteforce';
+import { qrOverlaySwap } from './attackers/qrOverlaySwap';
 import { runLegitPayment } from './legitPayment';
 import { getUser, getKnownPayee, getNeverPaidPayee, getTransaction } from './demoData';
 import { audit } from '../audit/logger';
@@ -41,6 +42,7 @@ const ATTACKERS: Record<ScenarioId, AttackFn> = {
   FORGED_WEBAUTHN_ASSERTION: forgedWebauthnAssertion,
   SESSION_JWT_TAMPER: sessionJwtTamper,
   STEPUP_BRUTEFORCE: stepUpBruteforce,
+  QR_OVERLAY_SWAP: qrOverlaySwap,
 };
 
 function makeContext(runId: string, attackerLabel: string): AttackContext {
@@ -69,6 +71,7 @@ function mapAuditEventToLayer(eventType: string) {
   if (eventType.startsWith('RISK')) return 'RISK' as const;
   if (eventType.startsWith('STEP_UP')) return 'SEMANTIC' as const;
   if (eventType.startsWith('PAYMENT')) return 'AUTHORIZATION' as const;
+  if (eventType.startsWith('QR')) return 'QR' as const;
   return 'NONE' as const;
 }
 
