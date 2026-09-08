@@ -24,7 +24,24 @@ import {
   AppState,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import * as Notifications from 'expo-notifications';
+/*
+ * Deep imports, not `from 'expo-notifications'`.
+ *
+ * The package barrel pulls DevicePushTokenAutoRegistration.fx, which registers
+ * a push-token listener at import time. Since SDK 53 that THROWS on Android in
+ * Expo Go ("remote notifications ... removed from Expo Go"), so the barrel
+ * takes the whole app down before the first render. Only remote push was
+ * removed; the local notifications this app actually uses still work, and
+ * these four submodules never touch the push path.
+ *
+ * ponytail: deep-imports into build/ — reaches inside the package, so re-check
+ * these paths on an expo-notifications upgrade. Switch back to the barrel once
+ * the app ships as a development build instead of running in Expo Go.
+ */
+import { setNotificationHandler } from 'expo-notifications/build/NotificationsHandler';
+import { requestPermissionsAsync } from 'expo-notifications/build/NotificationPermissions';
+import { scheduleNotificationAsync } from 'expo-notifications/build/scheduleNotificationAsync';
+import { addNotificationResponseReceivedListener } from 'expo-notifications/build/NotificationsEmitter';
 import {
   useFonts,
   Geist_400Regular,
@@ -64,7 +81,7 @@ export type Route =
   | { name: 'receive' }
   | { name: 'scan' }
   | { name: 'settings' }
-  | { name: 'authenticator'; token?: string };
+  | { name: 'authenticator' };
 
 /**
  * Foreground notifications are silent by default in Expo Go — without this,
@@ -72,7 +89,7 @@ export type Route =
  * A pending payment is exactly the case where the user might already be
  * looking at the phone, so it has to show either way.
  */
-Notifications.setNotificationHandler({
+setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
     shouldShowList: true,
@@ -147,38 +164,97 @@ export default function App() {
   }, []);
 
   /*
-   * Notice a web-portal step-up the instant it appears, and raise a local
-   * notification for it — no EAS project or push server involved, so this
-   * only fires while the app is running (foreground or recently
-   * backgrounded), never from fully closed. Tapping the notification jumps
-   * straight to the code screen with the token already in hand, skipping the
-   * manual QR scan.
+   * Two things this phone should learn about without being asked: a
+   * web-portal step-up waiting on it, and money arriving.
    *
-   * `notified` tracks the last txId a notification was already raised for,
-   * so a step-up still waiting on the next poll tick does not re-notify
-   * every 5 seconds.
+   * Both ride one 5s poll and one local notification — no EAS project or
+   * push server involved, so these only fire while the app is running
+   * (foreground or recently backgrounded), never from fully closed.
+   *
+   * `notified` / `lastCredit` track what has already been announced, so a
+   * step-up still open on the next tick does not re-notify every 5 seconds.
    */
   const notified = useRef<string | null>(null);
+  const seenCredits = useRef<Set<string> | null>(null);
   useEffect(() => {
     if (phase !== 'ready') return;
-    void Notifications.requestPermissionsAsync();
+    void requestPermissionsAsync();
 
     let cancelled = false;
+
     const tick = async () => {
       try {
         const pending = await api.devicePending();
-        if (cancelled || !pending.pending || pending.txId === notified.current) return;
-        notified.current = pending.txId;
-        await Notifications.scheduleNotificationAsync({
+        if (!cancelled && pending.pending && pending.txId !== notified.current) {
+          notified.current = pending.txId;
+          await scheduleNotificationAsync({
+            content: {
+              title: 'PRISM needs your approval',
+              /*
+               * The notification opens the SCANNER, and carries no token.
+               *
+               * The server can re-mint the challenge (`/device/pending`
+               * returns one), and an earlier build shipped it in this payload
+               * so a tap jumped straight to the six digits. That quietly
+               * removed the step-up's whole point: the code is meant to prove
+               * this phone SAW the payment as the portal drew it, verified
+               * from PRISM's own signature rather than from a page an
+               * attacker may control. A phone that never scanned proves only
+               * that it holds the pairing secret — which is exactly what a
+               * stolen-session attacker also has. So the scan stays
+               * mandatory, for the ₹50,000-and-above rule and every other
+               * step-up alike.
+               */
+              body: 'A payment on the web portal is waiting. Tap to scan the code it shows.',
+            },
+            trigger: null,
+          });
+        }
+      } catch {
+        /* a dropped poll just means the next tick tries again */
+      }
+
+      /*
+       * Money in. The statement is already the source of truth for this, so
+       * it is read rather than a new endpoint added; the first tick only
+       * records where the history stood, otherwise signing in would replay
+       * every credit the account ever took as a fresh notification.
+       */
+      try {
+        const history = await api.history();
+        const credits = history.filter((e) => e.direction === 'RECEIVED' && e.status === 'SETTLED');
+        if (cancelled) return;
+
+        // A credit settles later than it was created, so it can appear BELOW
+        // one already announced. Tracking ids rather than a high-water mark
+        // keeps that from silently swallowing a payment. The statement is
+        // capped at 30 rows, so the set is too.
+        if (seenCredits.current === null) {
+          seenCredits.current = new Set(credits.map((e) => e.txId));
+          return;
+        }
+        const unseen = credits.filter((e) => !seenCredits.current!.has(e.txId));
+        if (unseen.length === 0) return;
+        seenCredits.current = new Set(credits.map((e) => e.txId));
+
+        const [first] = unseen;
+        await scheduleNotificationAsync({
           content: {
-            title: 'PRISM needs your approval',
-            body: 'A payment on the web portal is waiting for your code. Tap to open it.',
-            data: { token: pending.token },
+            title:
+              unseen.length === 1
+                ? `Received ${first.amountFormatted}`
+                : `${unseen.length} payments received`,
+            body:
+              unseen.length === 1
+                ? `${first.counterpartyName} sent you ${first.amountFormatted}.`
+                : `${unseen.map((e) => e.amountFormatted).join(', ')} — tap to see your statement.`,
+            data: { received: true },
           },
           trigger: null,
         });
+        void refreshMe();
       } catch {
-        /* a dropped poll just means the next tick tries again */
+        /* same as above: the next tick tries again */
       }
     };
 
@@ -188,14 +264,17 @@ export default function App() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [phase]);
+  }, [phase, refreshMe]);
 
-  // A tapped notification carries the already-signed token, so the
-  // Authenticator screen opens straight to the code instead of the scanner.
+  /*
+   * Where a tapped notification lands. A received-payment banner opens the
+   * statement; a step-up banner opens the authenticator's SCANNER — it hands
+   * over no token, so the QR on the portal still has to be scanned.
+   */
   useEffect(() => {
-    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const token = response.notification.request.content.data?.token;
-      if (typeof token === 'string') nav.push({ name: 'authenticator', token });
+    const sub = addNotificationResponseReceivedListener((response) => {
+      const data = response.notification.request.content.data;
+      nav.push(data?.received ? { name: 'home' } : { name: 'authenticator' });
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -315,7 +394,7 @@ export default function App() {
         {route.name === 'timeline' && <Timeline txId={route.txId} nav={nav} />}
         {route.name === 'receive' && <Receive nav={nav} onRefresh={refreshMe} />}
         {route.name === 'scan' && <Scan nav={nav} />}
-        {route.name === 'authenticator' && <Authenticator token={route.token} nav={nav} />}
+        {route.name === 'authenticator' && <Authenticator nav={nav} />}
         {route.name === 'settings' && (
           <Settings
             me={me}

@@ -30,8 +30,8 @@ export default function Receive({ nav, onRefresh }: { nav: Nav; onRefresh: () =>
   /*
    * Watch the balance while a request is on screen.
    *
-   * The history endpoint lists payments you SENT, so a receiver would
-   * otherwise see nothing at all until they went looking. Polling /me is the
+   * A credit only reaches the statement once it settles, so a receiver would
+   * otherwise see nothing while the payer is mid-flow. Polling /me is the
    * honest, cheap way to notice money arriving, and it stops as soon as the
    * request expires.
    */

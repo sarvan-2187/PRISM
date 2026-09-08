@@ -112,17 +112,25 @@ export const policy = {
   },
 
   rateLimit: {
-    // Generous default so the demo never trips on itself.
+    /*
+     * DEMO SETTINGS. Both tiers are deliberately loose so a live walkthrough
+     * — several laptops, a phone polling every 5s, and the attack dashboard
+     * firing real requests — never dies on a 429 mid-story. Restore the
+     * production numbers in the comments below once the demo is over.
+     */
+    // Production: 300.
     defaultWindowMs: 15 * 60 * 1000,
-    defaultMax: 300,
-    // Strict where an attacker would brute-force: two-digit answers, auth.
-    // Raised from 20 for the multi-laptop demo: several people registering
-    // and retrying on one network exhausted 20/5min in normal use. A
-    // two-digit code needs up to 100 guesses, so 60 still trips before it
-    // can be exhausted, and the semantic check's own 3-attempt-per-payment
-    // cap is the primary defence regardless. Restore 20 after the demo.
+    defaultMax: 3000,
+    /*
+     * Strict where an attacker would brute-force: two-digit answers, auth.
+     * Production: 20. A two-digit code needs up to 100 guesses, so this tier
+     * no longer trips before that space is exhausted — the real defence for
+     * the semantic check is its own 3-attempts-per-payment cap, which is
+     * per-transaction and unaffected by anything here. Raising this does NOT
+     * loosen the step-up itself.
+     */
     strictWindowMs: 5 * 60 * 1000,
-    strictMax: 60,
+    strictMax: 500,
   },
 
   /**

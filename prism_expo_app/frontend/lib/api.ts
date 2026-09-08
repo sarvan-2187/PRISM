@@ -158,11 +158,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ code, biometric }),
     }),
+  /**
+   * `answer` is the six-digit transaction code for a paired account, or the
+   * two-digit quiz answer for one with no phone. One route, one attempt cap.
+   */
   stepUp: (txId: string, answer: string) =>
     request<{ ok: true; next: 'REAUTHORIZE' }>(`/payment/${txId}/step-up`, {
       method: 'POST',
       body: JSON.stringify({ answer }),
     }),
+  /** Re-open the 60s acceptance window. Buys time, never extra attempts. */
+  stepUpWindow: (txId: string) =>
+    request<{ expiresInSeconds: number }>(`/payment/${txId}/step-up/window`, { method: 'POST' }),
 
   requestQr: (amountMinor: number) =>
     request<{ token: string; expiresInSeconds: number }>('/qr/request', {

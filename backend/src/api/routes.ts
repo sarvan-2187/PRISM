@@ -1026,15 +1026,47 @@ router.get(
   })
 );
 
+/** Statement: money out at any status, money in once settled. */
 router.get(
   '/transactions',
   requireSession,
   wrap(async (req, res) => {
-    const { rows } = await query<TransactionRow>(
-      `SELECT * FROM transactions WHERE payer_user_id = $1 ORDER BY created_at DESC LIMIT 20`,
+    const { rows } = await query<TransactionRow & { direction: 'SENT' | 'RECEIVED' }>(
+      `SELECT t.*,
+              CASE WHEN t.payer_user_id = $1 THEN 'SENT' ELSE 'RECEIVED' END AS direction
+         FROM transactions t
+        WHERE t.payer_user_id = $1
+           OR (t.status = 'SETTLED'
+               AND t.payee_account_id IN (SELECT id FROM accounts WHERE user_id = $1))
+        ORDER BY t.created_at DESC
+        LIMIT 30`,
       [req.userId]
     );
-    res.json(await Promise.all(rows.map(present)));
+    res.json(
+      await Promise.all(
+        rows.map(async (tx) => {
+          const base = await present(tx);
+          if (tx.direction === 'SENT') {
+            return {
+              ...base,
+              direction: 'SENT' as const,
+              counterpartyName: base.payeeName,
+              counterpartyHandle: base.payeeHandle,
+            };
+          }
+          const { rows: payer } = await query<AccountRow>(
+            'SELECT * FROM accounts WHERE id = $1',
+            [tx.payer_account_id]
+          );
+          return {
+            ...base,
+            direction: 'RECEIVED' as const,
+            counterpartyName: payer[0]?.display_name ?? 'Unknown',
+            counterpartyHandle: payer[0]?.handle ?? '',
+          };
+        })
+      )
+    );
   })
 );
 

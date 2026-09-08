@@ -226,17 +226,18 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
 
   STEPUP_BRUTEFORCE: {
     id: 'STEPUP_BRUTEFORCE',
-    name: 'Semantic Step-Up Brute Force',
+    name: 'Step-Up Code Brute Force',
     category: 'Social Engineering / Brute Force',
     severity: 'MEDIUM',
     whatItIs:
-      'A brute-force attempt against the "last two digits of the amount" comprehension check that PRISM issues for a high-risk payment, hoping to guess the two-digit answer before running out of attempts.',
+      'A brute-force attempt against the step-up PRISM issues for a high-risk payment. For a paired account that is the six-digit transaction code; an account with no phone gets the last-two-digits comprehension check instead. Either way the attacker guesses, holding the session but not the device.',
     howItAffectsTheModel:
-      'The semantic step-up exists to catch social-engineering fraud where a genuine user is manipulated into approving a payment. If its two-digit answer could be brute-forced, the control would add friction without adding real security.',
-    attackerGoal: "Guess the correct two-digit answer to push a STEP_UP payment through without the payer's real comprehension.",
-    expectedDetectionLayer: 'Semantic verification + rate limiting (Semantic layer)',
+      'The step-up is what stands between a stolen session and a settled payment. If its answer could be brute-forced, the control would add friction without adding real security — and the attempt cap, not the keyspace, is what makes that true: the six-digit code has a million values and the digits quiz only a hundred, yet both close the transaction after three wrong tries.',
+    attackerGoal: "Guess the step-up answer to push a STEP_UP payment through without the payer's phone or real comprehension.",
+    expectedDetectionLayer: 'Step-up attempt cap + rate limiting (Semantic layer)',
     expectedDetectionFiles: [
-      'backend/src/modules/semantic/intentCheck.ts (per-transaction attempt cap)',
+      'backend/src/modules/semantic/intentCheck.ts (per-transaction attempt cap, shared by both challenges via verifyExternal)',
+      'backend/src/modules/authenticator/index.ts (verifyPaymentCode — the six digits are an HMAC over this intent hash)',
       'backend/src/api/middleware/rateLimiter.ts (strictLimiter on /payment/:id/step-up)',
     ],
     preconditions: [
@@ -245,7 +246,7 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
     expectedOutcome:
       'Wrong guesses are refused with failureCode STEP_UP_FAILED, and the transaction is blocked terminally once the attempt cap (3 wrong answers) is reached — there is no reset path, so exhausting the cap ends the run’s ability to keep guessing.',
     mechanism:
-      'The engine registers a real credential, signs a real payment approval to a never-before-paid payee for an amount designed to reach STEP_UP_REQUIRED, then submits a sequence of incorrect two-digit guesses to POST /payment/:id/step-up until the attempt cap is hit or exhausted.',
+      'The engine registers a real credential, signs a real payment approval to a never-before-paid payee for an amount designed to reach STEP_UP_REQUIRED, reads the step-up mode off the transaction, and submits a sequence of incorrect guesses to POST /payment/:id/step-up until the attempt cap is hit. On the six-digit path it first opens the 60-second acceptance window with the session it holds — allowed, and useless without the phone — so the run tests the CODE rather than the window.',
     attackerDevice: 'The device that received the STEP_UP challenge and is guessing at the same session — models an attacker who has taken over an in-progress approval flow.',
     targetDescription: 'A real live transaction already at STEP_UP_REQUIRED selected from the discovery feed, or — as a fallback — one the engine creates itself.',
     usesVictimSession: true,
@@ -253,7 +254,10 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
     assumptions: [
       'This run needs the live risk engine to actually reach STEP_UP_REQUIRED for the amount/payee combination used; PRISM’s risk thresholds are policy-owned and can legitimately produce APPROVE or BLOCK instead on a given run — if so, this is reported honestly as SIMULATED rather than forcing a result.',
     ],
-    limitations: ['A sufficiently pressured genuine victim reading the digits aloud to a scammer is a social problem this control reduces, not eliminates.'],
+    limitations: [
+      'A sufficiently pressured genuine victim reading the code or digits aloud to a scammer is a social problem this control reduces, not eliminates.',
+      'Three guesses out of a million prove the cap holds, not that the keyspace was searched. The claim being demonstrated is that no fourth guess is ever offered — which is the property that makes the keyspace size irrelevant.',
+    ],
   },
 
   QR_OVERLAY_SWAP: {
@@ -331,6 +335,7 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
     ],
   },
 };
+
 
 export function listCatalog(): ScenarioDefinition[] {
   return Object.values(CATALOG);

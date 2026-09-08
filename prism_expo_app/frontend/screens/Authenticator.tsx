@@ -2,10 +2,16 @@
  * This phone, standing in for a second device.
  *
  * A web-portal payment that needs a paired-device step-up shows a signed QR;
- * this screen scans it (or arrives pre-loaded from a tapped notification —
- * see App.tsx's pending-poll), verifies the signature, and derives the same
- * six digits PRISM Authenticator would. No separate app or second pairing:
- * this phone already holds the secret, because signing in here IS pairing.
+ * this screen scans it, verifies the signature, and derives the same six
+ * digits PRISM Authenticator would. No separate app or second pairing: this
+ * phone already holds the secret, because signing in here IS pairing.
+ *
+ * The scan is the ONLY way in. A notification can announce that a step-up is
+ * waiting, but it never carries the challenge — see App.tsx. Deriving a code
+ * from a token the phone was handed would prove possession of the pairing
+ * secret and nothing more; scanning proves this phone read the payment off
+ * the portal, signature-verified, which is the property the ₹50,000 rule is
+ * actually buying.
  *
  * Everything below the verified token is computed locally. Approving or
  * denying never touches the network from this screen — the six digits are
@@ -21,7 +27,7 @@ import { getApiBase, getPairing, getServerKey, setServerKey } from '../lib/store
 import { t, type as ty, mono, font } from '../lib/theme';
 import type { Nav } from '../App';
 
-export default function Authenticator({ token: preloaded, nav }: { token?: string; nav: Nav }) {
+export default function Authenticator({ nav }: { nav: Nav }) {
   const [serverKey, setKey] = useState<string | null>(null);
   const [secret, setSecret] = useState<Uint8Array | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,12 +60,6 @@ export default function Authenticator({ token: preloaded, nav }: { token?: strin
       setKey(key);
     })();
   }, []);
-
-  // A token handed in from a tapped notification skips the scan entirely.
-  useEffect(() => {
-    if (preloaded && serverKey) handle(preloaded);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [preloaded, serverKey]);
 
   useEffect(() => {
     if (!verified?.exp) return;

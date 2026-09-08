@@ -33,7 +33,7 @@ import { audit } from '../../../backend/src/modules/audit/logger';
 import { attestationChain } from '../../../backend/src/modules/attestation/chain';
 import { policyFirewall } from '../../../backend/src/modules/policy/firewall';
 import { dynamicQr } from '../../../backend/src/modules/qr/dynamicQr';
-import { authenticator } from '../../../backend/src/modules/authenticator';
+import { authenticator, authWindowKey } from '../../../backend/src/modules/authenticator';
 import { policy } from '../../../backend/src/config/policy';
 import redis from '../../../backend/src/utils/redis';
 
@@ -442,17 +442,49 @@ router.post(
     }
 
     /*
-     * A step-up here must NOT ask this same device for another code: the
-     * phone that just approved cannot prove anything new with a second HMAC
-     * from the same secret. Comprehension is a different property, so the app
-     * always falls back to the digits quiz.
+     * Step-up mode, chosen the same way the web backend chooses it: the
+     * six-digit transaction code whenever a device is paired, the digits quiz
+     * only for accounts that have none.
+     *
+     * An earlier build hardcoded SEMANTIC here, reasoning that a second HMAC
+     * from the phone that just approved proves nothing new. That is true of
+     * the FACTOR and false of the CONTROL: it left one payment surface where
+     * the answer was two guessable digits while the portal demanded six bound
+     * to the intent hash, and an attacker holding a session picks the weaker
+     * of the two. One step-up, one keyspace, everywhere.
+     *
+     * On this surface the code is derived on-device rather than scanned — the
+     * phone cannot photograph a QR it is itself displaying. That is possession
+     * of the pairing secret plus a fresh biometric, not a second device, and
+     * the audit trail says so via surface: 'MOBILE_APP'.
      */
     const semanticDone = await attestationChain.hasStage(tx.id, null, 'SEMANTIC_VERIFIED');
     if (decision.outcome === 'REQUIRE_SEMANTIC' && !semanticDone) {
+      const stepUpMode = hasAuthenticator ? 'AUTHENTICATOR' : 'SEMANTIC';
       await query(
-        `UPDATE transactions SET status = 'STEP_UP_REQUIRED', step_up_mode = 'SEMANTIC' WHERE id = $1`,
-        [tx.id]
+        `UPDATE transactions SET status = 'STEP_UP_REQUIRED', step_up_mode = $2 WHERE id = $1`,
+        [tx.id, stepUpMode]
       );
+      const reasons = [...risk.reasons, ...decision.firedRules.map((r) => r.reason)];
+
+      if (stepUpMode === 'AUTHENTICATOR') {
+        const ttl = policy.stepUp.authenticatorTtlSeconds;
+        await redis.set(authWindowKey(tx.id), '1', 'EX', ttl);
+        await audit.log('STEP_UP_ISSUED', {
+          transactionId: tx.id,
+          userId: req.userId,
+          data: { mode: 'AUTHENTICATOR', expiresInSeconds: ttl, surface: 'MOBILE_APP' },
+        });
+        res.status(202).json({
+          decision: 'STEP_UP',
+          mode: 'AUTHENTICATOR',
+          score: risk.score,
+          reasons,
+          expiresInSeconds: ttl,
+        });
+        return;
+      }
+
       const { rows } = await query<AccountRow>('SELECT * FROM accounts WHERE id = $1', [
         tx.payee_account_id,
       ]);
@@ -461,7 +493,7 @@ router.post(
         decision: 'STEP_UP',
         mode: 'SEMANTIC',
         score: risk.score,
-        reasons: [...risk.reasons, ...decision.firedRules.map((r) => r.reason)],
+        reasons,
         challenge,
       });
       return;
@@ -510,7 +542,53 @@ router.post(
   })
 );
 
-/** The digits quiz. Passing it requires re-authorizing, same as the web. */
+/**
+ * Re-open the acceptance window when the six digits went stale.
+ *
+ * The window, not the code, is what expires: the code is an HMAC over the
+ * intent hash and is therefore the same every time it is derived. Bounding
+ * how long the server will ACCEPT it is what keeps a code read off a screen
+ * an hour ago from settling anything, and it is enforced here rather than on
+ * the phone because the phone is the thing being checked.
+ */
+router.post(
+  '/payment/:id/step-up/window',
+  requireSession,
+  wrap(async (req, res) => {
+    const tx = await intentLock.get(req.params.id);
+    if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
+    if (intentLock.isExpired(tx)) fail('INTENT_EXPIRED');
+    if (tx.status !== 'STEP_UP_REQUIRED') {
+      fail('STEP_UP_FAILED', { reason: 'no step-up is pending for this transaction' });
+    }
+    if (tx.step_up_mode !== 'AUTHENTICATOR') {
+      fail('STEP_UP_FAILED', { reason: 'this transaction is not waiting on a device code' });
+    }
+
+    /*
+     * Re-opening buys TIME, never ATTEMPTS. The cap lives in its own Redis key
+     * counted per transaction, so a caller looping this route to refresh the
+     * window still gets exactly three wrong codes before the payment closes.
+     */
+    const ttl = policy.stepUp.authenticatorTtlSeconds;
+    await redis.set(authWindowKey(tx.id), '1', 'EX', ttl);
+    await audit.log('STEP_UP_ISSUED', {
+      transactionId: tx.id,
+      userId: req.userId,
+      data: { mode: 'AUTHENTICATOR', expiresInSeconds: ttl, surface: 'MOBILE_APP', reissued: true },
+    });
+    res.json({ expiresInSeconds: ttl });
+  })
+);
+
+/**
+ * The step-up answer. Passing it requires re-authorizing, same as the web.
+ *
+ * Two challenges, one route, one attempt counter — mirroring the web backend
+ * exactly. AUTHENTICATOR is the six-digit transaction code (every paired
+ * account); SEMANTIC is the digits quiz that remains for accounts with no
+ * phone. Neither path can be used to escape the other's cap.
+ */
 router.post(
   '/payment/:id/step-up',
   requireSession,
@@ -522,7 +600,26 @@ router.post(
       fail('STEP_UP_FAILED', { reason: 'no step-up is pending for this transaction' });
     }
 
-    await semantic.verify(tx, String(req.body.answer ?? ''));
+    if (tx.step_up_mode === 'AUTHENTICATOR') {
+      const live = await redis.get(authWindowKey(tx.id));
+      if (!live) {
+        fail('STEP_UP_FAILED', {
+          reason: 'that code has expired, ask for a new one',
+          expired: true,
+        });
+      }
+      const ok = await authenticator.verifyPaymentCode(
+        req.userId!,
+        tx.intent_hash,
+        String(req.body.answer ?? '')
+      );
+      // Shares the semantic module's cap, audit events and pass flag, so three
+      // wrong codes close the transaction exactly as three wrong digits would.
+      await semantic.verifyExternal(tx, ok);
+      await redis.del(authWindowKey(tx.id)); // single use
+    } else {
+      await semantic.verify(tx, String(req.body.answer ?? ''));
+    }
     const attempt = await attestationChain.currentAttempt(tx.id);
     await attestationChain.append(tx.id, 'SEMANTIC_VERIFIED', { verified: true });
     await audit.log('STEP_UP_PASSED', {

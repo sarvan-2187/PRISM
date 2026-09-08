@@ -124,3 +124,4 @@ export const qrReplay: AttackFn = async (ctx, target) => {
   };
   return result;
 };
+

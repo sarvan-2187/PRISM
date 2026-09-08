@@ -1,11 +1,9 @@
 /**
- * Home. Balance, what this account has sent, and where to go next.
+ * Home. Balance, this account's statement, and where to go next.
  *
- * The history endpoint returns payments where you are the PAYER, so a
- * receiving account sees an empty table here no matter how much money has
- * arrived. The empty state says that in words rather than implying the
- * account has no activity: money received shows in the balance, and the
- * Receive screen reports it as it lands.
+ * The history endpoint returns both sides: payments you sent at any status,
+ * and money that reached you once it settled. Each row carries its own
+ * direction and counterparty, so a receiving account sees its credits here.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';

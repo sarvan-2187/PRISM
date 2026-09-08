@@ -175,10 +175,10 @@ export default function Pay() {
                     <AtSign aria-hidden="true" />
                     PRISM ID
                   </TabsTrigger>
-                  <TabsTrigger value="card">
+                  {/* <TabsTrigger value="card">
                     <CreditCard aria-hidden="true" />
                     Card
-                  </TabsTrigger>
+                  </TabsTrigger> */}
                   <TabsTrigger value="saved">
                     <Users aria-hidden="true" />
                     Saved
