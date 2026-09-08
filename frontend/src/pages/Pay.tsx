@@ -14,8 +14,9 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AtSign, CreditCard, Users } from 'lucide-react';
-import { api, ApiError, Payee, cardsEnabled } from '@/lib/api-client';
+import { api, ApiError, OfflineError, Payee, cardsEnabled } from '@/lib/api-client';
 import { useSession } from '@/lib/session';
+import { useOnline } from '@/lib/useOnline';
 import { rupeesToPaise } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -78,6 +79,7 @@ function formatCardNumber(raw: string): string {
 export default function Pay() {
   const navigate = useNavigate();
   const { me } = useSession();
+  const online = useOnline();
 
   const [payees, setPayees] = useState<Payee[] | null>(null);
   const [mode, setMode] = useState('id');
@@ -117,7 +119,7 @@ export default function Pay() {
 
   const recipientReady =
     mode === 'id' ? idReady : mode === 'card' ? cardReady : savedReady;
-  const canSubmit = amountOk && recipientReady && !busy;
+  const canSubmit = amountOk && recipientReady && !busy && online;
 
   async function submit() {
     setBusy(true);
@@ -131,7 +133,11 @@ export default function Pay() {
           : await api.initiate(mode === 'id' ? matched!.accountId : payeeId, amountMinor);
       navigate(`/pay/${tx.txId}`);
     } catch (err) {
-      setError(err instanceof ApiError ? `${err.failureCode}: ${err.message}` : String(err));
+      if (err instanceof OfflineError) {
+        setError("You're offline. Nothing was sent — reconnect and try again.");
+      } else {
+        setError(err instanceof ApiError ? `${err.failureCode}: ${err.message}` : String(err));
+      }
       setBusy(false);
     }
   }
@@ -345,7 +351,11 @@ export default function Pay() {
               )}
 
               <Button block className="mt-4" onClick={submit} disabled={!canSubmit}>
-                {busy ? 'Locking this transaction…' : 'Review this payment'}
+                {busy
+                  ? 'Locking this transaction…'
+                  : !online
+                    ? "You're offline"
+                    : 'Review this payment'}
               </Button>
             </>
           )}

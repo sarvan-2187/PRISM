@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "createdAt": "2026-09-07T21:51:53.139Z",
+        "reason": "user confirmed: Geist is the portal's typeface and the phone must match it, because the user is comparing the two screens side by side during a payment"
+      }
+    ]
+  }
+}

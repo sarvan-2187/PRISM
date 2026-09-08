@@ -23,6 +23,7 @@ import { SessionProvider, useSession } from '@/lib/session';
 import { ThemeProvider } from '@/lib/theme';
 import { ModeToggle } from '@/components/mode-toggle';
 import { Button } from '@/components/ui/button';
+import { useOnline } from '@/lib/useOnline';
 import { cn } from '@/lib/utils';
 
 import Landing from '@/pages/Landing';
@@ -44,6 +45,9 @@ import AttackDetail from '@/pages/attacks/AttackDetail';
 /** Views that get the wide column. Everything else is the focused flow. */
 const WIDE = ['/home', '/profile', '/settings', '/policy', '/offline', '/attacks'];
 
+/** Wide also covers nested pages, e.g. /attacks/:scenarioId. */
+const isWide = (p: string) => WIDE.some((w) => p === w || p.startsWith(w + '/'));
+
 const NAV = [
   { to: '/home', label: 'Home' },
   { to: '/pay', label: 'Send' },
@@ -56,10 +60,18 @@ const NAV = [
   { to: '/attacks', label: 'Attack Sim' },
 ];
 
-/** Inner routes need a session. While it is being fetched, render nothing. */
+/**
+ * Inner routes need a session. While it is being fetched, render nothing.
+ *
+ * A dropped connection must never look like a sign-out: `offline` here means
+ * the last /me refresh could not reach PRISM at all, not that it came back
+ * 401. Bouncing to the landing page on that signal used to abandon whatever
+ * payment was mid-flight the instant a request found the network gone.
+ */
 function RequireSession({ children }: { children: ReactNode }) {
-  const { me, loading } = useSession();
+  const { me, loading, offline } = useSession();
   if (loading) return null;
+  if (!me && offline) return null;
   if (!me) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
@@ -71,8 +83,9 @@ function guard(element: ReactNode) {
 function Shell() {
   const { pathname } = useLocation();
   const { me, signOut } = useSession();
+  const online = useOnline();
 
-  const wide = WIDE.includes(pathname) || pathname.startsWith('/attacks');
+  const wide = isWide(pathname);
   // The landing hero runs edge to edge and under the header, so on that one
   // route the shell stops constraining and the header stops painting.
   const bleed = pathname === '/';
@@ -157,6 +170,24 @@ function Shell() {
         </div>
       </header>
 
+      {/*
+        Skipped on the landing route: its header is absolutely positioned
+        over the hero (the `bleed` layout) so a sibling banner here would sit
+        underneath it instead of pushing it down. Nobody has a payment
+        in-flight before signing in, so there is nothing this banner needs to
+        protect on that one route.
+      */}
+      {!online && !bleed && (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-b bg-warning-subtle px-6 py-2 text-small font-medium text-warning max-md:px-4"
+        >
+          <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-warning-mark" />
+          You&rsquo;re offline. PRISM pauses new payments until your connection returns &mdash;
+          nothing in progress is charged early or lost.
+        </div>
+      )}
+
       {me && (
         <div
           className={cn(
@@ -196,8 +227,14 @@ function Shell() {
           <Route path="/offline" element={guard(<Offline />)} />
           <Route path="/profile" element={guard(<Profile />)} />
           <Route path="/settings" element={guard(<Settings />)} />
-          <Route path="/attacks" element={guard(<AttackDashboard />)} />
-          <Route path="/attacks/:scenarioId" element={guard(<AttackDetail />)} />
+          {/*
+            The Attack Lab is gated by the operator token, not a PRISM
+            session: the operator is a judge or demonstrator, not an account
+            holder. Wrapping it in RequireSession would lock out the very
+            person it exists for.
+          */}
+          <Route path="/attacks" element={<AttackDashboard />} />
+          <Route path="/attacks/:scenarioId" element={<AttackDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
 

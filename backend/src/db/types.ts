@@ -23,6 +23,8 @@ export type LedgerDirection = 'DEBIT' | 'CREDIT';
 export type AuthorizationStage =
   | 'INTENT_LOCKED'
   | 'WEBAUTHN_APPROVED'
+  /** Approved with a paired-device code instead of a passkey (PRISM App). */
+  | 'DEVICE_APPROVED'
   | 'CONTEXT_VERIFIED'
   | 'POLICY_EVALUATED'
   | 'RISK_APPROVED'
@@ -74,8 +76,12 @@ export interface TransactionRow {
   created_at: Date;
   expires_at: Date;
   status: TransactionStatus;
+  /** How the payer started this server-locked intent (migration 004). */
+  origin: 'MANUAL' | 'QR';
   risk_score: number | null;
   risk_reasons: string[];
+  /** Which challenge a stepped-up transaction is waiting on (migration 003). */
+  step_up_mode: 'SEMANTIC' | 'AUTHENTICATOR' | null;
   failure_code: string | null;
   settled_at: Date | null;
   amended_from: string | null; // (002) this tx supersedes that one

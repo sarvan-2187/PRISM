@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import fs from 'fs';
 import https from 'https';
 import { config } from './config/env';
+import { keyManager } from './modules/keys/keyManager';
 import { disabledControls } from './config/policy';
 import router from './api/routes';
 import attackRouter from './api/attackRoutes';
@@ -15,6 +16,18 @@ import pool from './db/pool';
 import redis from './utils/redis';
 
 const app: Application = express();
+
+/*
+ * The LAN/tunnel demo serves the frontend through Vite, which proxies /api
+ * here. Without this, every laptop arrives as 127.0.0.1 and they all share a
+ * single rate-limit bucket — one person's step-up attempts lock out everyone
+ * else. `1` means "one proxy hop", so req.ip is the last X-Forwarded-For
+ * entry, the one Vite appended. A client that forges its own header cannot
+ * shift that, so rate limits stay per-device and unspoofable.
+ *
+ * Requires xfwd:true on the Vite proxy (see frontend/vite.config.ts).
+ */
+app.set('trust proxy', 1);
 
 app.use(helmet());
 // Credentials must be allowed for the session cookie to travel. WEBAUTHN_EXPECTED_ORIGIN
@@ -46,6 +59,20 @@ app.use('/api/v1/attacks', attackRouter);
 // session for the demo, not the operator console — see demoSessionReveal.ts
 // for why it is gated independently and never reachable in production.
 app.use('/api/v1/demo', demoSessionRouter);
+/**
+ * The published Ed25519 key that signs step-up challenge tokens.
+ *
+ * The Authenticator app fetches this once at pairing and verifies every token
+ * before showing a payee and amount. Without that check, anyone who can render
+ * a QR controls what the second device displays — which is precisely the fraud
+ * the second device exists to catch. Public half only: verification needs
+ * nothing secret, which is why this route has no session guard.
+ */
+app.get('/.well-known/prism-keys', async (_req, res) => {
+  const key = await keyManager.qrPublicKey();
+  res.json({ keys: [key] });
+});
+
 app.use('/api/v1', router);
 app.use(errorHandler);
 

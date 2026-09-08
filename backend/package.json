@@ -9,6 +9,7 @@
     "db:migrate": "ts-node src/db/migrate.ts",
     "db:seed": "ts-node src/db/seed.ts",
     "db:reset": "ts-node src/db/reset.ts",
+    "test": "npm run test:hash && npm run test:canon2 && npm run test:challenge && npm run test:risk && npm run test:network && npm run test:semantic && npm run test:qr && npm run test:chain && npm run test:otp",
     "provision:attacks": "ts-node --transpile-only src/db/provisionAttacks.ts",
     "test": "npm run test:hash && npm run test:canon2 && npm run test:challenge && npm run test:risk && npm run test:network && npm run test:semantic && npm run test:qr && npm run test:chain && npm run test:offline",
     "test:hash": "ts-node src/utils/canonical.test.ts",
@@ -23,7 +24,8 @@
     "test:offline": "ts-node --transpile-only src/modules/offline/offline.test.ts",
     "test:e2e": "ts-node --transpile-only src/modules/intent/payment.e2e.ts",
     "lint": "eslint src --ext .ts",
-    "format": "prettier --write src/**/*.ts"
+    "format": "prettier --write src/**/*.ts",
+    "test:otp": "ts-node src/modules/authenticator/otp.test.ts"
   },
   "dependencies": {
     "@simplewebauthn/server": "^9.0.0",

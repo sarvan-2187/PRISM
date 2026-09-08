@@ -32,6 +32,14 @@ import { fail } from '../../api/errors';
 export const STAGE_ORDER: AuthorizationStage[] = [
   'INTENT_LOCKED',
   'WEBAUTHN_APPROVED',
+  // The mobile app cannot hold a passkey (React Native has no
+  // navigator.credentials, and a native one needs a signed build), so it
+  // authorizes with an HMAC over the same intent hash. Sitting BESIDE
+  // WEBAUTHN_APPROVED rather than replacing it keeps both orderings
+  // strictly increasing, so each path validates on its own without an
+  // either/or in the comparator - and the trail says plainly which of the
+  // two actually happened, because they are not equally strong.
+  'DEVICE_APPROVED',
   'CONTEXT_VERIFIED',
   'POLICY_EVALUATED',
   'RISK_APPROVED',

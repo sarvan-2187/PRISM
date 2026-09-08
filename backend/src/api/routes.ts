@@ -18,6 +18,19 @@ import { offlineGrant } from '../modules/offline/grant';
 import { offlineRedeem } from '../modules/offline/redeem';
 import { policy, disabledControls } from '../config/policy';
 import { AuthorizationStage } from '../db/types';
+import { authenticator, PAIRING_TTL_SECONDS } from '../modules/authenticator';
+import { keyManager } from '../modules/keys/keyManager';
+import redis from '../utils/redis';
+
+/**
+ * Marks that an Authenticator code was issued for this transaction, and when.
+ *
+ * The code itself is derived from the intent hash alone, so it never expires
+ * on the phone and a drifted phone clock cannot break it. The WINDOW is
+ * enforced here instead: this key exists for policy.stepUp.authenticatorTtlSeconds
+ * and its absence is what makes a stale code worthless.
+ */
+const authWindowKey = (txId: string) => `stepup:auth:${txId}`;
 
 /** Stages every payment must have in its chain before it can settle. */
 const REQUIRED_STAGES: AuthorizationStage[] = [
@@ -95,6 +108,8 @@ async function present(tx: TransactionRow) {
     riskScore: tx.risk_score,
     riskReasons: tx.risk_reasons,
     failureCode: tx.failure_code,
+    /** Which challenge a stepped-up transaction is waiting on. */
+    stepUpMode: tx.step_up_mode,
   };
 }
 
@@ -119,7 +134,7 @@ router.post(
     const user = await userByEmail(String(req.body.email ?? ''));
     await assertMayEnrol(user, req);
     await identity.verifyRegistration(user.id, req.body.response);
-    await issueSession(res, user.id);
+    await issueSession(res, user.id, req.secure);
     res.json({ ok: true, userId: user.id, displayName: user.display_name });
   })
 );
@@ -139,7 +154,7 @@ router.post(
   wrap(async (req, res) => {
     const user = await userByEmail(String(req.body.email ?? ''));
     await identity.verifyLogin(user.id, req.body.response);
-    await issueSession(res, user.id);
+    await issueSession(res, user.id, req.secure);
     res.json({ ok: true, userId: user.id, displayName: user.display_name });
   })
 );
@@ -408,7 +423,16 @@ router.post(
     const scoredTx = { ...tx, risk_score: risk.score };
 
     // 8. Policy firewall. Its decision cites rules, not a score.
-    const decision = await policyFirewall.evaluate({ tx: scoredTx, signals, isDuressCredential });
+    // A paired phone changes what an elevated score, a large amount or a
+    // daily cap MEANS: escalate to the second device rather than refuse. Read
+    // once here so the policy rules stay pure functions of their context.
+    const hasAuthenticator = await authenticator.hasActiveDevice(req.userId!);
+    const decision = await policyFirewall.evaluate({
+      tx: scoredTx,
+      signals,
+      isDuressCredential,
+      hasAuthenticator,
+    });
     await attestationChain.append(tx.id, 'POLICY_EVALUATED', {
       outcome: decision.outcome,
       firedRules: decision.firedRules.map((r) => r.id),
@@ -454,13 +478,25 @@ router.post(
     const semanticDone = await attestationChain.hasStage(tx.id, null, 'SEMANTIC_VERIFIED');
     const needsSemantic = decision.outcome === 'REQUIRE_SEMANTIC';
     if (needsSemantic && !semanticDone) {
-      await query(`UPDATE transactions SET status = 'STEP_UP_REQUIRED' WHERE id = $1`, [tx.id]);
+      /*
+       * Which challenge this transaction waits on. A paired phone replaces the
+       * last-two-digits quiz entirely: the six digits are an HMAC over this
+       * transaction's own intent hash, produced on hardware the attacker does
+       * not hold. The quiz remains for accounts with no phone, so nobody is
+       * dead-ended by not owning one.
+       */
+      const stepUpMode = hasAuthenticator ? 'AUTHENTICATOR' : 'SEMANTIC';
+      await query(
+        `UPDATE transactions SET status = 'STEP_UP_REQUIRED', step_up_mode = $2 WHERE id = $1`,
+        [tx.id, stepUpMode]
+      );
       const { rows } = await query<AccountRow>('SELECT * FROM accounts WHERE id = $1', [
         tx.payee_account_id,
       ]);
       const challenge = await semantic.issue(tx, rows[0]?.display_name ?? 'Unknown');
       res.status(202).json({
         decision: decision.outcome === 'REQUIRE_SEMANTIC' ? 'CONFIRM_CHANGE' : 'STEP_UP',
+        mode: stepUpMode,
         score: risk.score,
         reasons: [...risk.reasons, ...decision.firedRules.map((r) => r.reason)],
         changes: challenge.changes ?? null,
@@ -534,14 +570,48 @@ router.post(
       fail('STEP_UP_FAILED', { reason: 'no step-up is pending for this transaction' });
     }
 
-    await semantic.verify(tx, String(req.body.answer ?? ''));
+    /*
+     * Two challenges, one route, one attempt counter.
+     *
+     * AUTHENTICATOR is the paired-phone code; SEMANTIC is the digits quiz for
+     * accounts with no phone. Neither path can be used to escape the other's
+     * cap, and both end in the same place.
+     */
+    if (tx.step_up_mode === 'AUTHENTICATOR') {
+      // The 60-second window, enforced here rather than on the phone.
+      const live = await redis.get(authWindowKey(tx.id));
+      if (!live) {
+        fail('STEP_UP_FAILED', {
+          reason: 'that code has expired, ask the portal for a new one',
+          expired: true,
+        });
+      }
+      const ok = await authenticator.verifyPaymentCode(
+        req.userId!,
+        tx.intent_hash,
+        String(req.body.answer ?? '')
+      );
+      // Shares the semantic module's cap, audit events and pass flag, so three
+      // wrong codes close the transaction exactly as three wrong digits would.
+      await semantic.verifyExternal(tx, ok);
+      await redis.del(authWindowKey(tx.id)); // single use
+    } else {
+      await semantic.verify(tx, String(req.body.answer ?? ''));
+    }
 
     // Record comprehension on the chain, in the attempt that is mid-flight. The
     // re-authorization then finds SEMANTIC_VERIFIED present and can mint a
     // capability that lists it as satisfied — this is what makes step-up an
     // actual precondition of settlement rather than a detour.
     const attempt = await attestationChain.currentAttempt(tx.id);
-    await attestationChain.append(tx.id, 'SEMANTIC_VERIFIED', { verified: true });
+    // On the SEMANTIC path the client re-authorizes, which opens a new attempt
+    // and writes RISK_APPROVED there, so the stage goes on the chain now. On
+    // the AUTHENTICATOR path this route finishes the SAME attempt, and the
+    // chain requires RISK_APPROVED before SEMANTIC_VERIFIED — so that ordering
+    // is handled below, after the risk engine has actually run again.
+    if (tx.step_up_mode !== 'AUTHENTICATOR') {
+      await attestationChain.append(tx.id, 'SEMANTIC_VERIFIED', { verified: true });
+    }
     await audit.log('STEP_UP_PASSED', { transactionId: tx.id, userId: req.userId, data: { attempt } });
 
     // Guarded so a concurrent block cannot be undone by this write.
@@ -551,7 +621,243 @@ router.post(
       [tx.id]
     );
 
-    res.json({ ok: true, next: 'REAUTHORIZE' });
+    /*
+     * The phone code COMPLETES the payment. There is no second passkey prompt.
+     *
+     * Asking for the passkey again would prove possession of the laptop that
+     * already signed thirty seconds ago — it adds a tap, not a factor. The
+     * code proves possession of separate hardware, which is the thing the
+     * first signature could not establish, so it is the stronger second
+     * factor and it finishes the authorization on its own.
+     *
+     * Everything after this point is the same pipeline /authorize runs, minus
+     * the signature check: the same context evaluation, the same risk engine,
+     * the same policy firewall, the same chain verification and the same
+     * atomic settlement. Nothing is skipped, and the WEBAUTHN_APPROVED stage
+     * from this very attempt is still what roots the chain.
+     */
+    if (tx.step_up_mode !== 'AUTHENTICATOR') {
+      // Digits path is unchanged: it re-authorizes with the passkey, because
+      // the quiz alone proves nothing about who is holding the device.
+      res.json({ ok: true, next: 'REAUTHORIZE' });
+      return;
+    }
+
+    /*
+     * CONTEXT_VERIFIED and POLICY_EVALUATED are already on this attempt's
+     * chain, written by the authorize call that asked for the step-up. They
+     * are not re-appended: the chain forbids a stage repeating out of order,
+     * and re-verifying the same context would not make it more true. The
+     * checks below still RUN — their results just gate the settlement rather
+     * than adding links.
+     */
+    const attempt2 = await attestationChain.currentAttempt(tx.id);
+    const snapshot2 = context.snapshot(req, {});
+    const signals2 = await context.evaluate(
+      req.userId!,
+      snapshot2,
+      tx.payee_account_id,
+      parseInt(tx.amount_minor, 10)
+    );
+
+    const risk2 = await riskEngine.evaluate(tx.id, req.userId!, {
+      ...signals2,
+      amountMinor: parseInt(tx.amount_minor, 10),
+    });
+    await query(
+      `UPDATE transactions SET risk_score = $2, risk_decision = $3, fired_rule_ids = $4 WHERE id = $1`,
+      [tx.id, risk2.score, risk2.decision, risk2.firedRuleIds]
+    );
+
+    /*
+     * Re-run the firewall with the step-up now satisfied. A rule that still
+     * DENIES here denies for a reason the phone code cannot answer — a daily
+     * cap, a blocked payee — and the code proving possession of the device
+     * does not make those go away.
+     */
+    const decision2 = await policyFirewall.evaluate({
+      tx: { ...tx, risk_score: risk2.score },
+      signals: signals2,
+      isDuressCredential: false,
+      hasAuthenticator: true,
+    });
+    if (decision2.outcome === 'DENY') {
+      await intentLock.markFailed(tx.id, 'POLICY_DENIED', 'BLOCKED');
+      await audit.log('POLICY_DENIED', {
+        transactionId: tx.id,
+        userId: req.userId,
+        data: { firedRules: decision2.firedRules.map((r) => r.id), riskScore: risk2.score },
+      });
+      throw new PrismError(403, 'POLICY_DENIED', 'A payment policy refused this transaction.', {
+        rules: decision2.firedRules,
+        score: risk2.score,
+      });
+    }
+
+    // Order matters and is enforced by the chain: risk, then the step-up that
+    // answered it, then the authorization to settle.
+    await attestationChain.append(tx.id, 'RISK_APPROVED', {
+      score: risk2.score,
+      decision: risk2.decision,
+      firedRuleIds: risk2.firedRuleIds,
+    });
+    await attestationChain.append(tx.id, 'SEMANTIC_VERIFIED', {
+      verified: true,
+      via: 'AUTHENTICATOR',
+    });
+
+    const required2: AuthorizationStage[] = [...REQUIRED_STAGES, 'SEMANTIC_VERIFIED'];
+    await attestationChain.append(tx.id, 'SETTLEMENT_AUTHORIZED', { mode: 'NORMAL' });
+    const capability2 = await attestationChain.mintCapability(
+      tx.id,
+      attempt2,
+      tx.intent_hash,
+      required2,
+      'NORMAL',
+      policy.intentTtlSeconds
+    );
+    await query(`UPDATE transactions SET status = 'AUTHORIZED' WHERE id = $1`, [tx.id]);
+    await audit.log('SETTLEMENT_AUTHORIZED', {
+      transactionId: tx.id,
+      userId: req.userId,
+      data: { attempt: attempt2, mode: 'NORMAL', capabilityId: capability2.id, via: 'AUTHENTICATOR' },
+    });
+
+    const settled = await settlement.settle(tx, capability2);
+    await intentLock.consumeNonce(tx.nonce);
+    await context.updateBaseline(req.userId!, snapshot2);
+
+    res.json({
+      ok: true,
+      next: 'SETTLED',
+      decision: 'APPROVED',
+      score: risk2.score,
+      reasons: risk2.reasons,
+      settledAt: settled.settledAt.toISOString(),
+      balanceMinor: settled.payerBalanceMinor,
+      balanceFormatted: formatMinor(settled.payerBalanceMinor),
+    });
+  })
+);
+
+/**
+ * The signed challenge the PRISM Authenticator scans.
+ *
+ * Signed, not plain, because the app renders the payee and amount from it so
+ * the user can compare them against the portal. An unsigned token would let
+ * anyone who can draw a QR choose what the second device displays, which is
+ * precisely the fraud the second device exists to catch. The phone verifies it
+ * with the public key from /.well-known/prism-keys and needs no network after.
+ *
+ * Issuing also opens the 60-second acceptance window.
+ */
+router.get(
+  '/payment/:id/step-up/token',
+  requireSession,
+  wrap(async (req, res) => {
+    const tx = await intentLock.get(req.params.id);
+    if (tx.payer_user_id !== req.userId) fail('NOT_FOUND');
+    if (tx.status !== 'STEP_UP_REQUIRED') {
+      fail('STEP_UP_FAILED', { reason: 'no step-up is pending for this transaction' });
+    }
+    if (tx.step_up_mode !== 'AUTHENTICATOR') {
+      fail('STEP_UP_FAILED', { reason: 'this transaction is not waiting on a paired device' });
+    }
+
+    const ttl = policy.stepUp.authenticatorTtlSeconds;
+    const { rows } = await query<AccountRow>('SELECT * FROM accounts WHERE id = $1', [
+      tx.payee_account_id,
+    ]);
+    const seen = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM transactions
+        WHERE payer_user_id = $1 AND payee_account_id = $2 AND status = 'SETTLED'`,
+      [req.userId, tx.payee_account_id]
+    );
+
+    const token = await keyManager.signQrToken(
+      {
+        txId: tx.id,
+        intentHash: tx.intent_hash,
+        payee: rows[0]?.display_name ?? 'Unknown',
+        payeeIsNew: parseInt(seen.rows[0].n, 10) === 0,
+        amountMinor: parseInt(tx.amount_minor, 10),
+        currency: tx.currency,
+        score: tx.risk_score,
+        reasons: tx.risk_reasons,
+      },
+      ttl
+    );
+
+    await redis.set(authWindowKey(tx.id), '1', 'EX', ttl);
+    await audit.log('STEP_UP_ISSUED', {
+      transactionId: tx.id,
+      userId: req.userId,
+      data: { mode: 'AUTHENTICATOR', expiresInSeconds: ttl },
+    });
+
+    res.json({ token, expiresInSeconds: ttl });
+  })
+);
+
+// ──────────────────────────────────────────────────────────────
+// PRISM Authenticator — the paired second device
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Mint a PENDING device and its secret.
+ *
+ * The secret is RETURNED so the portal can draw it as a QR, and is never
+ * accepted back from the phone: on a plain-HTTP LAN a secret POSTed by the
+ * phone would be readable on the wire. Same shape as an otpauth:// URI.
+ */
+router.post(
+  '/authenticator/pair/start',
+  requireSession,
+  strictLimiter,
+  wrap(async (req, res) => {
+    const offer = await authenticator.startPairing(req.userId!);
+    await audit.log('AUTHENTICATOR_PAIR_STARTED', {
+      userId: req.userId,
+      data: { deviceId: offer.deviceId, expiresInSeconds: PAIRING_TTL_SECONDS }, // never the secret
+    });
+    res.status(201).json(offer);
+  })
+);
+
+router.post(
+  '/authenticator/pair/confirm',
+  requireSession,
+  strictLimiter,
+  wrap(async (req, res) => {
+    const ok = await authenticator.confirmPairing(req.userId!, String(req.body.deviceId ?? ''));
+    if (!ok) fail('AUTH_FAILED', { reason: 'no pending pairing for this account, or it expired' });
+    await audit.log('AUTHENTICATOR_PAIRED', {
+      userId: req.userId,
+      data: { deviceId: req.body.deviceId },
+    });
+    res.json({ ok: true });
+  })
+);
+
+/** Does this account have a second device? Drives the settings screen. */
+router.get(
+  '/authenticator',
+  requireSession,
+  wrap(async (req, res) => {
+    const device = await authenticator.describeActive(req.userId!);
+    res.json({ paired: device !== null, device });
+  })
+);
+
+/** Lost phone. One-way, exactly like revoking a passkey. */
+router.post(
+  '/authenticator/revoke',
+  requireSession,
+  wrap(async (req, res) => {
+    const revoked = await authenticator.revokeActive(req.userId!);
+    if (!revoked) fail('NOT_FOUND', { reason: 'no active authenticator device' });
+    await audit.log('AUTHENTICATOR_REVOKED', { userId: req.userId, data: {} });
+    res.json({ ok: true });
   })
 );
 

@@ -1,0 +1,33 @@
+{
+  "name": "prism-app",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "private": true,
+  "scripts": {
+    "start": "expo start",
+    "test": "tsx lib/otp.test.ts"
+  },
+  "dependencies": {
+    "@expo-google-fonts/geist": "^0.4.2",
+    "@expo-google-fonts/geist-mono": "^0.4.3",
+    "@expo/vector-icons": "^15.0.2",
+    "@noble/hashes": "^2.4.0",
+    "expo": "^57.0.20",
+    "expo-camera": "~57.0.4",
+    "expo-cellular": "~57.0.1",
+    "expo-font": "~57.0.3",
+    "expo-local-authentication": "~57.0.2",
+    "expo-secure-store": "~57.0.3",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-qrcode-svg": "^6.3.23",
+    "react-native-svg": "^15.15.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "@types/react": "^19.2.18",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

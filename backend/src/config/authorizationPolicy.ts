@@ -12,6 +12,8 @@
  * Precedence when several rules fire:  DURESS_HOLD > DENY > REQUIRE_SEMANTIC > ALLOW
  * The strongest outcome wins, and every firing rule is recorded on the chain.
  */
+
+import { policy } from './policy';
 import type { ContextSignals } from '../modules/context/fingerprint';
 import type { TransactionRow } from '../db/types';
 
@@ -19,6 +21,9 @@ import type { TransactionRow } from '../db/types';
 export const POLICY_VERSION = 1;
 
 export type PolicyOutcome = 'ALLOW' | 'REQUIRE_SEMANTIC' | 'DENY' | 'DURESS_HOLD';
+
+/** Single source for the high-value bar. See policy.highValueMinor. */
+const HIGH_VALUE_MINOR = policy.highValueMinor;
 
 export interface PolicyContext {
   tx: TransactionRow;
@@ -31,6 +36,8 @@ export interface PolicyContext {
   settledTodayMinor: number;
   /** Server clock hour, 0-23, for the night-window rule. */
   hour: number;
+  /** The payer has an ACTIVE PRISM Authenticator device paired. */
+  hasAuthenticator: boolean;
 }
 
 export interface PolicyRule {
@@ -64,31 +71,89 @@ export const POLICY_RULES: PolicyRule[] = [
     id: 'ELEVATED_RISK',
     outcome: 'DENY',
     reason: 'The device and account signals for this payment are too strong to allow.',
-    // The digits fallback for high-risk-but-unchanged transactions was removed
-    // (it was bypassable and looped forever). Instead: an elevated score on a
-    // transaction that was NOT amended is a hard refusal with a cited reason.
-    // 60 sits above "new payee" (NEW_PAYEE 30 + NO_BASELINE 25 = 55, a normal
-    // first payment) and at-or-below "new device" (NEW_DEVICE 35 + NO_BASELINE
-    // 25 = 60), which is the second-browser / stolen-session case the demo
-    // shows being stopped.
-    when: (c) => !c.isAmendment && (c.tx.risk_score ?? 0) >= 60,
+    // An elevated score on a transaction that was NOT amended is a hard
+    // refusal with a cited reason. 60 sits above "new payee" (NEW_PAYEE 30 +
+    // NO_BASELINE 25 = 55, a normal first payment) and at-or-below "new
+    // device" (NEW_DEVICE 35 + NO_BASELINE 25 = 60), which is the
+    // second-browser / stolen-session case the demo shows being stopped.
+    //
+    // Applies only when the payer has NO second device. With one paired, the
+    // rule below escalates instead of refusing.
+    when: (c) => !c.isAmendment && !c.hasAuthenticator && (c.tx.risk_score ?? 0) >= 60,
+  },
+  {
+    id: 'ELEVATED_RISK_SECOND_DEVICE',
+    outcome: 'REQUIRE_SEMANTIC',
+    reason: 'This payment needs approval from your paired phone.',
+    /*
+     * The same score, a different answer, because the account has somewhere
+     * better to ask.
+     *
+     * A flat refusal dead-ends a genuine user and, worse, skips the only
+     * control that addresses a payer who is real but being manipulated. With
+     * a paired device the six digits are an HMAC over THIS transaction's
+     * intent hash, produced on hardware the attacker does not hold, and read
+     * against a payee and amount the attacker cannot redraw. A stolen laptop
+     * scoring 90 still fails — one step later, because the thief does not
+     * have the phone.
+     *
+     * Mutually exclusive with ELEVATED_RISK above: exactly one of the two can
+     * match, so the stronger DENY never masks this escalation.
+     */
+    when: (c) => !c.isAmendment && c.hasAuthenticator && (c.tx.risk_score ?? 0) >= 60,
   },
   {
     id: 'NEW_PAYEE_LARGE_AMOUNT',
     outcome: 'DENY',
-    reason: 'A first payment to a new recipient above ₹10,000 is not allowed.',
-    when: (c) => c.signals.newPayee && rupees(parseInt(c.tx.amount_minor, 10)) > 10_000,
+    reason: 'A first payment to a new recipient above ₹10,000 needs a paired phone.',
+    // Only refuses outright when there is no second device to ask. With one
+    // paired, HIGH_VALUE_AUTHENTICATOR escalates instead.
+    when: (c) =>
+      c.signals.newPayee && !c.hasAuthenticator && rupees(parseInt(c.tx.amount_minor, 10)) > 10_000,
   },
   {
     id: 'DAILY_LIMIT',
     outcome: 'DENY',
     reason: "This payment would take today's transfers over the ₹50,000 limit.",
-    when: (c) => rupees(c.settledTodayMinor + parseInt(c.tx.amount_minor, 10)) > 50_000,
+    when: (c) =>
+      !c.hasAuthenticator && rupees(c.settledTodayMinor + parseInt(c.tx.amount_minor, 10)) > 50_000,
+  },
+  {
+    id: 'HIGH_VALUE_AUTHENTICATOR',
+    outcome: 'REQUIRE_SEMANTIC',
+    reason: 'Payments of ₹50,000 or more must be approved on your paired phone.',
+    /*
+     * The evidence required rises with what is at stake.
+     *
+     * Below the threshold a laptop passkey is the whole authorization. At or
+     * above it the money is large enough that one coerced approval is not
+     * recoverable, so PRISM demands a factor the laptop cannot produce: a code
+     * derived on separate hardware from this transaction's own intent hash,
+     * read against a payee and amount the attacker cannot redraw.
+     */
+    when: (c) => c.hasAuthenticator && parseInt(c.tx.amount_minor, 10) >= HIGH_VALUE_MINOR,
+  },
+  {
+    id: 'HIGH_VALUE_NO_DEVICE',
+    outcome: 'DENY',
+    reason:
+      'Payments of ₹50,000 or more need a paired phone. Pair one in Settings, then try again.',
+    // The refusal names the remedy. A dead end with no way forward is the
+    // failure mode the Authenticator exists to remove.
+    when: (c) => !c.hasAuthenticator && parseInt(c.tx.amount_minor, 10) >= HIGH_VALUE_MINOR,
   },
   {
     id: 'NIGHT_NEW_PAYEE',
-    outcome: 'DENY',
-    reason: 'New recipients cannot be paid between 11 PM and 6 AM.',
+    // Was DENY. A flat refusal gave a genuine user at 1 AM no way through at
+    // all, and it fired before the risk engine's step-up branch, so the
+    // comprehension check could never run between 11 PM and 6 AM. Requiring
+    // the check instead keeps the rule's intent — scam calls cluster at odd
+    // hours, so a first payment to a stranger then deserves extra friction —
+    // while leaving the user a path that a coached victim still cannot take
+    // without reading the real amount aloud.
+    outcome: 'REQUIRE_SEMANTIC',
+    reason:
+      'A first payment to a new recipient between 11 PM and 6 AM needs the amount confirmed.',
     when: (c) => c.signals.newPayee && (c.hour >= 23 || c.hour < 6),
   },
 ];

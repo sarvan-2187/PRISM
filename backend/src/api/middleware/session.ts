@@ -26,16 +26,22 @@ declare global {
 }
 
 /** Issue the session cookie after a verified passkey login. */
-export async function issueSession(res: Response, userId: string): Promise<void> {
+export async function issueSession(res: Response, userId: string, secure = false): Promise<void> {
   const token = await keyManager.signSession(userId, SESSION_TTL_SECONDS);
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true, // not readable from JS — XSS cannot lift it
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    // Mirror the transport the browser used: HTTPS → Secure cookie, HTTP → plain.
+    // In development this is read from the X-Forwarded-Proto header that Vite's
+    // proxy adds (xfwd:true), which Express sees as req.secure when trust proxy=1.
+    // Without this, cookies issued on https://prism.local:5173 lacked the Secure
+    // flag and were dropped by strict browser policies, forcing a second sign-in.
+    secure,
     maxAge: SESSION_TTL_SECONDS * 1000,
     path: '/',
   });
 }
+
 
 export function clearSession(res: Response): void {
   res.clearCookie(SESSION_COOKIE, { path: '/' });

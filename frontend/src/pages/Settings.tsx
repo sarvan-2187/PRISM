@@ -22,8 +22,11 @@ import {
   MonitorSmartphone,
   Plus,
   Laptop,
+  Smartphone,
+  ShieldAlert,
 } from 'lucide-react';
-import { api, ApiError } from '@/lib/api-client';
+import { QRCodeSVG } from 'qrcode.react';
+import { api, ApiError, type AuthenticatorDevice } from '@/lib/api-client';
 import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
 import { useSession } from '@/lib/session';
 import { relativeTime } from '@/lib/format';
@@ -491,6 +494,214 @@ function DevicesTab({
 
 // ── Page root ─────────────────────────────────────────────────────────────────
 
+
+/* -- Authenticator: the paired second device ---------------------------- */
+
+/**
+ * Pairing shows the device secret on screen as a QR and never receives it
+ * back. The phone photographs it; nothing carrying the secret is ever sent
+ * from the phone to the server, which matters because the demo LAN may be
+ * plain HTTP. Same shape as an otpauth:// enrolment URI.
+ *
+ * Confirmation happens HERE rather than on the phone: the route requires a
+ * session and the phone has no cookie.
+ */
+function AuthenticatorTab() {
+  const [state, setState] = useState<{ paired: boolean; device: AuthenticatorDevice | null } | null>(
+    null
+  );
+  const [offer, setOffer] = useState<{ deviceId: string; secret: string } | null>(null);
+  const [left, setLeft] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setState(await api.authenticator());
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not reach PRISM.');
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Local countdown on the pairing window. The server enforces expiry; this
+  // only stops someone photographing a code that is already dead.
+  useEffect(() => {
+    if (left <= 0) return;
+    const id = setInterval(() => setLeft((n) => Math.max(0, n - 1)), 1000);
+    return () => clearInterval(id);
+  }, [left]);
+
+  async function start() {
+    setBusy(true);
+    setError(null);
+    try {
+      const o = await api.pairStart();
+      setOffer({ deviceId: o.deviceId, secret: o.secret });
+      setLeft(o.expiresInSeconds);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not start pairing.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirm() {
+    if (!offer) return;
+    setConfirming(true);
+    setError(null);
+    try {
+      await api.pairConfirm(offer.deviceId);
+      setOffer(null);
+      await load();
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.failureCode === 'AUTH_FAILED'
+            ? 'That pairing expired. Generate a new code.'
+            : err.message
+          : 'Could not confirm pairing.'
+      );
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  async function revoke() {
+    setBusy(true);
+    try {
+      await api.authenticatorRevoke();
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not revoke.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const uri = offer
+    ? 'prism://pair?d=' + encodeURIComponent(offer.deviceId) + '&s=' + encodeURIComponent(offer.secret)
+    : '';
+  const expired = Boolean(offer) && left <= 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-body-lg">
+          <Smartphone className="size-4" />
+          PRISM Authenticator
+        </CardTitle>
+        <CardDescription>
+          A paired phone turns a refused high-risk payment into one you can still approve, on a
+          device an attacker does not hold. It also lets you report a payment as fraud with a code
+          that looks exactly like an approval.
+        </CardDescription>
+      </CardHeader>
+
+      <CardContent>
+        {error && (
+          <Alert variant="destructive" className="mb-5">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {!state && <Skeleton className="h-14 w-full" />}
+
+        {state?.paired && state.device && !offer && (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border p-4">
+              <div className="flex items-center gap-3">
+                <ShieldCheck className="size-5 shrink-0 text-success" />
+                <div>
+                  <p className="font-medium">Phone paired</p>
+                  <p className="text-caption text-secondary-foreground">
+                    since {relativeTime(state.device.confirmedAt ?? state.device.createdAt)}
+                  </p>
+                </div>
+              </div>
+              <Button variant="destructive" size="sm" onClick={revoke} disabled={busy}>
+                Revoke
+              </Button>
+            </div>
+            <p className="mt-3 text-small text-secondary-foreground">
+              Lost the phone? Revoking is immediate and one-way. High-risk payments go back to being
+              refused outright.
+            </p>
+            <Button variant="secondary" className="mt-4" onClick={start} disabled={busy}>
+              Pair a different phone
+            </Button>
+          </>
+        )}
+
+        {state && !state.paired && !offer && (
+          <div className="rounded-lg border border-dashed border-border-strong px-6 py-8 text-center">
+            <ShieldAlert className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
+            <p className="mt-3 font-medium">No phone paired</p>
+            <p className="mx-auto mt-1 max-w-[46ch] text-pretty text-small text-secondary-foreground">
+              Without one, a payment PRISM scores as high risk is refused with no way through.
+            </p>
+            <Button className="mt-5" onClick={start} disabled={busy}>
+              {busy ? 'Preparing...' : 'Pair a phone'}
+            </Button>
+          </div>
+        )}
+
+        {offer && (
+          <div className="grid gap-6 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start">
+            {/* Light plate in both themes: a phone camera reads this across a
+                table, and contrast is what the camera needs. */}
+            <div className="qr-plate mx-auto" aria-label="Pairing QR code">
+              <QRCodeSVG value={uri} size={196} level="M" includeMargin />
+            </div>
+
+            <div>
+              <p className="font-medium">Scan this with PRISM Authenticator</p>
+              <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-small text-secondary-foreground">
+                <li>Open the app on your phone and enter this portal&rsquo;s address.</li>
+                <li>
+                  Tap <strong className="font-medium text-foreground">Scan pairing code</strong>.
+                </li>
+                <li>Come back here and confirm.</li>
+              </ol>
+
+              <p
+                className={
+                  expired
+                    ? 'mt-4 text-small text-destructive'
+                    : 'mt-4 text-small text-secondary-foreground'
+                }
+              >
+                {expired ? 'This code has expired.' : 'Valid for ' + left + 's'}
+              </p>
+
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Button onClick={confirm} disabled={confirming || expired}>
+                  {confirming ? 'Confirming...' : 'I have scanned it'}
+                </Button>
+                <Button variant="secondary" onClick={start} disabled={busy}>
+                  New code
+                </Button>
+                <Button variant="ghost" onClick={() => setOffer(null)}>
+                  Cancel
+                </Button>
+              </div>
+
+              <p className="mt-4 text-pretty text-caption text-muted-foreground">
+                The secret in this code is shown to your screen only. The phone never sends it back,
+                so it is never on the network.
+              </p>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Settings() {
   const { me, signOut } = useSession();
   const creds = useCreds();
@@ -537,6 +748,10 @@ export default function Settings() {
             <MonitorSmartphone className="size-3.5" />
             Devices
           </TabsTrigger>
+          <TabsTrigger value="authenticator">
+            <Smartphone className="size-3.5" />
+            Authenticator
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="passkeys">
@@ -545,6 +760,10 @@ export default function Settings() {
 
         <TabsContent value="devices">
           <DevicesTab {...creds} signOut={signOut} />
+        </TabsContent>
+
+        <TabsContent value="authenticator">
+          <AuthenticatorTab />
         </TabsContent>
       </Tabs>
     </div>

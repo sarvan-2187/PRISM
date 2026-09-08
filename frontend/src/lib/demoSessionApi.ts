@@ -6,7 +6,13 @@
  * — it is never assumed to exist, always probed first (mirrors the
  * `cardsEnabled()` pattern in api-client.ts).
  */
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+/*
+ * Empty by default so requests are relative and travel through the Vite
+ * proxy. A hardcoded localhost:4000 points at the VISITOR's own machine, so
+ * every call fails with ERR_CONNECTION_REFUSED on any device but the host.
+ * Same rule as lib/api-client.ts.
+ */
+const API_URL = import.meta.env.VITE_API_URL ?? '';
 
 export async function demoSessionRevealEnabled(): Promise<boolean> {
   try {

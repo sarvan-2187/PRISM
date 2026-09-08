@@ -68,5 +68,6 @@ export const LAYER_LABEL: Record<PrismLayer, string> = {
   AUTHORIZATION: 'Authorization',
   LEDGER: 'Ledger / Settlement',
   NETWORK: 'Network Microfingerprint',
+  QR: 'Dynamic QR',
   NONE: 'No PRISM layer',
 };

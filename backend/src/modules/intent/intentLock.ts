@@ -27,6 +27,8 @@ export interface LockRequest {
   payerAccountId: string;
   payeeAccountId: string;
   amountMinor: number;
+  /** Server-recorded entry point; never accepted from an untrusted client. */
+  origin?: 'MANUAL' | 'QR';
   /** Set when this intent supersedes an earlier one (an amendment). */
   amendedFrom?: string;
 }
@@ -79,8 +81,8 @@ export class IntentLockModule {
       await client.query(
         `INSERT INTO transactions
            (id, payer_user_id, payer_account_id, payee_account_id, amount_minor,
-            currency, intent_hash, nonce, lock_version, created_at, expires_at, status, amended_from)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING',$11)`,
+            currency, intent_hash, nonce, lock_version, created_at, expires_at, status, amended_from, origin)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING',$11,$12)`,
         [
           txId,
           req.payerUserId,
@@ -93,6 +95,7 @@ export class IntentLockModule {
           createdAt,
           expiresAt,
           req.amendedFrom ?? null,
+          req.origin ?? 'MANUAL',
         ]
       );
       await attestationChain.append(

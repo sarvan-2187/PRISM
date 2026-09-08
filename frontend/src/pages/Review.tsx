@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
-import { api, ApiError, TransactionView } from '@/lib/api-client';
+import { api, ApiError, OfflineError, TransactionView } from '@/lib/api-client';
 import { webauthn, describeWebAuthnError } from '@/lib/webauthn-client';
 import { LiveLog } from '@/components/LiveLog';
 import { usePoll } from '@/lib/usePoll';
@@ -49,7 +49,9 @@ export default function Review() {
       setError(
         err instanceof ApiError
           ? { code: err.failureCode, message: err.message }
-          : { code: 'UNREACHABLE', message: 'Could not reach PRISM.' }
+          : err instanceof OfflineError
+            ? { code: 'OFFLINE', message: "You're offline. This will load once you reconnect." }
+            : { code: 'UNREACHABLE', message: 'Could not reach PRISM.' }
       );
     }
   }, [txId]);
@@ -57,6 +59,14 @@ export default function Review() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // The transaction never loaded because the browser was offline at the
+  // time — retry the instant connectivity returns instead of leaving the
+  // user stuck on "Cannot open this payment" until they refresh by hand.
+  useEffect(() => {
+    if (online && !tx) void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [online]);
 
   // Local countdown off the server's own secondsRemaining. The server decides
   // expiry; this only shows it.
@@ -91,14 +101,30 @@ export default function Review() {
       const assertion = await webauthn.approve(options);
       const result = await api.authorize(txId, assertion);
 
-      if (result.decision === 'STEP_UP') {
+      // Two server decisions both mean "a comprehension check is pending":
+      // STEP_UP from the risk engine, CONFIRM_CHANGE from the policy
+      // firewall's REQUIRE_SEMANTIC outcome. Matching only the first sent
+      // the user to Status while a challenge sat waiting, which looked like
+      // the second passkey prompt never happening.
+      if (result.decision === 'STEP_UP' || result.decision === 'CONFIRM_CHANGE') {
         navigate(`/pay/${txId}/verify`);
         return;
       }
       await refresh();
       navigate(`/pay/${txId}/status`);
     } catch (err) {
-      if (err instanceof ApiError) {
+      if (err instanceof OfflineError) {
+        // Whichever call dropped — /challenge or /authorize — nothing was
+        // charged: the passkey signature only ever authorizes THIS intent
+        // hash, and settlement only happens if /authorize's response reaches
+        // the browser. Staying on this screen (never navigating to Status,
+        // never treating it as a passkey failure) lets the same click retry
+        // cleanly once the connection is back.
+        setError({
+          code: 'OFFLINE',
+          message: "You're offline. Nothing was charged — reconnect and approve again.",
+        });
+      } else if (err instanceof ApiError) {
         // Terminal refusals belong on the status screen with the full reasons.
         if (
           ['RISK_BLOCKED', 'REPLAY_BLOCKED', 'TAMPER_BLOCKED', 'INTENT_EXPIRED'].includes(
@@ -127,16 +153,21 @@ export default function Review() {
   }
 
   if (error && !tx) {
+    const offlineError = error.code === 'OFFLINE';
     return (
       <Card>
         <CardContent className="grid gap-4 pt-6">
           <div>
-            <h1 className="text-h3 font-semibold">Cannot open this payment</h1>
+            <h1 className="text-h3 font-semibold">
+              {offlineError ? "You're offline" : 'Cannot open this payment'}
+            </h1>
             <p className="mt-2 text-small text-secondary-foreground">
-              It may belong to another account, or it may never have existed.
+              {offlineError
+                ? 'Nothing was lost — this reloads automatically the moment your connection returns.'
+                : 'It may belong to another account, or it may never have existed.'}
             </p>
           </div>
-          <Alert variant="destructive">
+          <Alert variant={offlineError ? 'warning' : 'destructive'}>
             <AlertDescription>
               {error.code}: {error.message}
             </AlertDescription>
@@ -258,8 +289,12 @@ export default function Review() {
             </>
           ) : (
             <div className="mt-5 flex flex-wrap gap-2 max-md:flex-col">
-              <Button className="flex-1" onClick={approve} disabled={busy}>
-                {busy ? 'Waiting for your passkey…' : `Approve ${tx.amountFormatted}`}
+              <Button className="flex-1" onClick={approve} disabled={busy || !online}>
+                {busy
+                  ? 'Waiting for your passkey…'
+                  : !online
+                    ? "You're offline"
+                    : `Approve ${tx.amountFormatted}`}
               </Button>
               <Button asChild variant="secondary" className="max-md:w-full">
                 <Link to="/home">Cancel</Link>

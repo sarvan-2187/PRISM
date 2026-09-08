@@ -35,3 +35,9 @@ S2-PLAN/
 
 # S4 personal working notes (local only, not part of the submission)
 S4-PLAN/
+
+# mkcert local dev certificates (private keys — never commit)
+certs/
+
+# PRISM App working notes (local only, not part of the submission)
+APP-PLAN/
