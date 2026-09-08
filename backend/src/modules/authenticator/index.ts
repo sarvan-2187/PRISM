@@ -9,9 +9,12 @@
  */
 import * as devices from './devices';
 import { approvalCode, denialCode, loginCode, codesMatch } from './otp';
+import { authWindowKey, mintChallenge, pendingFor } from './challenge';
 
 export { PAIRING_TTL_SECONDS } from './devices';
 export type { PairingOffer } from './devices';
+export { authWindowKey } from './challenge';
+export type { PendingChallenge } from './challenge';
 
 export const authenticator = {
   // ── Pairing ──────────────────────────────────────────────────────────
@@ -20,6 +23,22 @@ export const authenticator = {
   hasActiveDevice: devices.hasActiveDevice,
   describeActive: devices.describeActive,
   revokeActive: devices.revokeActive,
+
+  /**
+   * Which account an ACTIVE device id belongs to, or null. Never the secret:
+   * the phone's pending-step-up poll only needs to know whose transactions
+   * to look at, same rule as everything else in this module.
+   */
+  async userIdForDevice(deviceId: string): Promise<string | null> {
+    const device = await devices.activeDeviceById(deviceId);
+    return device?.user_id ?? null;
+  },
+
+  // ── Step-up challenge ────────────────────────────────────────────────
+  // One signing path shared by the portal's session-authed mint and every
+  // paired device's poll — see challenge.ts.
+  mintChallenge,
+  pendingFor,
 
   // ── Verification ─────────────────────────────────────────────────────
   // Three bindings, one primitive. That is the design: the same six digits

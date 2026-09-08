@@ -83,6 +83,20 @@ export default function Settings({
         </View>
       )}
 
+      <View style={{ marginTop: 18 }}>
+        <Label>SECOND-DEVICE APPROVAL</Label>
+        <Small>
+          This phone can also approve step-ups for payments made on the web portal — it already
+          holds the pairing secret. PRISM notifies this phone when one is waiting; you can also
+          open it directly and scan the code from your laptop screen.
+        </Small>
+        <Button
+          title="Approve a web payment"
+          variant="secondary"
+          onPress={() => nav.push({ name: 'authenticator' })}
+        />
+      </View>
+
       {error && <Notice tone="danger">{error}</Notice>}
 
       <Button

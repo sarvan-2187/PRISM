@@ -585,4 +585,24 @@ router.get(
   })
 );
 
+/**
+ * Is a step-up waiting on this account right now — from a payment made on
+ * the WEB PORTAL, not this app? PRISM App shares the same pairing (it
+ * imports `authenticator` from the web backend, same `authenticator_devices`
+ * row), so a phone signed in here already holds everything needed to answer
+ * one: no separate Authenticator app or second pairing required.
+ *
+ * Session-authed rather than deviceId-authed like the web backend's twin
+ * route, because this app already has a session — it never needs the
+ * deviceId workaround a session-less phone would.
+ */
+router.get(
+  '/device/pending',
+  requireSession,
+  wrap(async (req, res) => {
+    const pending = await authenticator.pendingFor(req.userId!);
+    res.json(pending ? { pending: true, ...pending } : { pending: false });
+  })
+);
+
 export default router;

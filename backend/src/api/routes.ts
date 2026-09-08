@@ -18,19 +18,8 @@ import { offlineGrant } from '../modules/offline/grant';
 import { offlineRedeem } from '../modules/offline/redeem';
 import { policy, disabledControls } from '../config/policy';
 import { AuthorizationStage } from '../db/types';
-import { authenticator, PAIRING_TTL_SECONDS } from '../modules/authenticator';
-import { keyManager } from '../modules/keys/keyManager';
+import { authenticator, authWindowKey, PAIRING_TTL_SECONDS } from '../modules/authenticator';
 import redis from '../utils/redis';
-
-/**
- * Marks that an Authenticator code was issued for this transaction, and when.
- *
- * The code itself is derived from the intent hash alone, so it never expires
- * on the phone and a drifted phone clock cannot break it. The WINDOW is
- * enforced here instead: this key exists for policy.stepUp.authenticatorTtlSeconds
- * and its absence is what makes a stale code worthless.
- */
-const authWindowKey = (txId: string) => `stepup:auth:${txId}`;
 
 /** Stages every payment must have in its chain before it can settle. */
 const REQUIRED_STAGES: AuthorizationStage[] = [
@@ -765,28 +754,7 @@ router.get(
     }
 
     const ttl = policy.stepUp.authenticatorTtlSeconds;
-    const { rows } = await query<AccountRow>('SELECT * FROM accounts WHERE id = $1', [
-      tx.payee_account_id,
-    ]);
-    const seen = await query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM transactions
-        WHERE payer_user_id = $1 AND payee_account_id = $2 AND status = 'SETTLED'`,
-      [req.userId, tx.payee_account_id]
-    );
-
-    const token = await keyManager.signQrToken(
-      {
-        txId: tx.id,
-        intentHash: tx.intent_hash,
-        payee: rows[0]?.display_name ?? 'Unknown',
-        payeeIsNew: parseInt(seen.rows[0].n, 10) === 0,
-        amountMinor: parseInt(tx.amount_minor, 10),
-        currency: tx.currency,
-        score: tx.risk_score,
-        reasons: tx.risk_reasons,
-      },
-      ttl
-    );
+    const token = await authenticator.mintChallenge(tx, ttl);
 
     await redis.set(authWindowKey(tx.id), '1', 'EX', ttl);
     await audit.log('STEP_UP_ISSUED', {
@@ -858,6 +826,41 @@ router.post(
     if (!revoked) fail('NOT_FOUND', { reason: 'no active authenticator device' });
     await audit.log('AUTHENTICATOR_REVOKED', { userId: req.userId, data: {} });
     res.json({ ok: true });
+  })
+);
+
+/**
+ * Polled by the paired phone itself — no PRISM session, because the phone
+ * never has one. `deviceId` is what it authenticates with instead: an
+ * unguessable id that identifies which account's pending step-up to look at,
+ * the same information already visible to anyone standing close enough to
+ * read the portal's QR. Lets the Authenticator app raise a local notification
+ * and jump straight to the code screen instead of the user having to notice a
+ * step-up is waiting and go scan it by hand.
+ *
+ * Deliberately does not touch the acceptance window: the portal's own
+ * `/payment/:id/step-up/token` call is what opens it and sets its TTL. This
+ * route only re-signs the same challenge for as long as that window is still
+ * live, so polling it on a timer can never keep a stale window artificially
+ * alive.
+ */
+router.get(
+  '/authenticator/pending',
+  defaultLimiter,
+  wrap(async (req, res) => {
+    const deviceId = String(req.query.deviceId ?? '');
+    if (!deviceId) {
+      res.json({ pending: false });
+      return;
+    }
+    const userId = await authenticator.userIdForDevice(deviceId);
+    if (!userId) {
+      res.json({ pending: false });
+      return;
+    }
+
+    const pending = await authenticator.pendingFor(userId);
+    res.json(pending ? { pending: true, ...pending } : { pending: false });
   })
 );
 

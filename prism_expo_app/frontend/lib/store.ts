@@ -15,6 +15,7 @@ const K_EMAIL = 'prism.email';
 const K_TOKEN = 'prism.session';
 const K_DEVICE = 'prism.deviceId';
 const K_SECRET = 'prism.secret';
+const K_PUBKEY = 'prism.serverPublicKey';
 
 export interface Pairing {
   deviceId: string;
@@ -71,4 +72,16 @@ export async function clearPairing(): Promise<void> {
   await del(K_DEVICE);
   await del(K_SECRET);
   await del(K_TOKEN);
+  await del(K_PUBKEY);
 }
+
+/**
+ * The server's Ed25519 public key (JWK), fetched once and cached.
+ *
+ * Verifying a web-portal step-up token needs this before the app trusts
+ * anything it says about payee or amount — the same rule PRISM Authenticator
+ * follows, and the reason this app checks a signature at all rather than
+ * just decoding the payload.
+ */
+export const getServerKey = () => get(K_PUBKEY);
+export const setServerKey = (jwk: string) => set(K_PUBKEY, jwk);

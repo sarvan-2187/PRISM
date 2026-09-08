@@ -16,7 +16,11 @@
       }
     },
     "android": {
-      "permissions": ["android.permission.CAMERA", "android.permission.USE_BIOMETRIC"]
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
     },
     "plugins": [
       [
@@ -28,7 +32,8 @@
       [
         "expo-local-authentication",
         { "faceIDPermission": "PRISM asks for Face ID before it approves a payment." }
-      ]
+      ],
+      ["expo-notifications", { "color": "#3b82f6" }]
     ]
   }
 }

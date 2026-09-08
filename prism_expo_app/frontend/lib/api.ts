@@ -176,6 +176,17 @@ export const api = {
     request<{ paired: boolean; device: { id: string; confirmedAt: string | null } | null }>(
       '/device'
     ),
+  /**
+   * Is a step-up waiting on this account from a payment made on the WEB
+   * PORTAL? Polled while the app is open so it can raise a local
+   * notification the instant one appears, instead of the user having to
+   * notice and go scan a QR by hand.
+   */
+  devicePending: () =>
+    request<
+      | { pending: false }
+      | { pending: true; txId: string; token: string; expiresInSeconds: number }
+    >('/device/pending'),
   policy: () =>
     request<{
       intentTtlSeconds: number;

@@ -104,6 +104,23 @@ export async function activeDeviceFor(userId: string): Promise<DeviceRow | null>
   return rows[0] ?? null;
 }
 
+/**
+ * The account an ACTIVE device id belongs to, or null.
+ *
+ * The paired phone has no PRISM session — pairing is the only credential it
+ * holds — so this is what lets it identify itself for the pending-step-up
+ * poll. `id` is an unguessable UUID, not a secret; it authorizes nothing on
+ * its own beyond "which account's pending step-up to look at," which is the
+ * same information already visible to anyone who can see the portal's QR.
+ */
+export async function activeDeviceById(deviceId: string): Promise<DeviceRow | null> {
+  const { rows } = await query<DeviceRow>(
+    `SELECT * FROM authenticator_devices WHERE id = $1 AND status = 'ACTIVE' LIMIT 1`,
+    [deviceId]
+  );
+  return rows[0] ?? null;
+}
+
 /** Does this user have a second device at all? Cheap: never selects the secret. */
 export async function hasActiveDevice(userId: string): Promise<boolean> {
   const { rows } = await query<{ one: number }>(

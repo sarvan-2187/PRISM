@@ -11,7 +11,7 @@
  * APP-PLAN/APP-PLAN.md §1 for what that trade costs and why the audit trail
  * names it.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   SafeAreaView,
   View,
@@ -24,6 +24,7 @@ import {
   AppState,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import * as Notifications from 'expo-notifications';
 import {
   useFonts,
   Geist_400Regular,
@@ -46,6 +47,7 @@ import Timeline from './screens/Timeline';
 import Receive from './screens/Receive';
 import Scan from './screens/Scan';
 import Settings from './screens/Settings';
+import Authenticator from './screens/Authenticator';
 
 import { api, ApiError, type Me } from './lib/api';
 import { getApiBase, getPairing, getToken, clearToken, clearPairing } from './lib/store';
@@ -61,7 +63,23 @@ export type Route =
   | { name: 'timeline'; txId: string }
   | { name: 'receive' }
   | { name: 'scan' }
-  | { name: 'settings' };
+  | { name: 'settings' }
+  | { name: 'authenticator'; token?: string };
+
+/**
+ * Foreground notifications are silent by default in Expo Go — without this,
+ * a step-up notification would only ever appear while the app is backgrounded.
+ * A pending payment is exactly the case where the user might already be
+ * looking at the phone, so it has to show either way.
+ */
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 export interface Nav {
   push: (r: Route) => void;
@@ -126,6 +144,61 @@ export default function App() {
     } catch {
       /* the screen that needed it will show its own error */
     }
+  }, []);
+
+  /*
+   * Notice a web-portal step-up the instant it appears, and raise a local
+   * notification for it — no EAS project or push server involved, so this
+   * only fires while the app is running (foreground or recently
+   * backgrounded), never from fully closed. Tapping the notification jumps
+   * straight to the code screen with the token already in hand, skipping the
+   * manual QR scan.
+   *
+   * `notified` tracks the last txId a notification was already raised for,
+   * so a step-up still waiting on the next poll tick does not re-notify
+   * every 5 seconds.
+   */
+  const notified = useRef<string | null>(null);
+  useEffect(() => {
+    if (phase !== 'ready') return;
+    void Notifications.requestPermissionsAsync();
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const pending = await api.devicePending();
+        if (cancelled || !pending.pending || pending.txId === notified.current) return;
+        notified.current = pending.txId;
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'PRISM needs your approval',
+            body: 'A payment on the web portal is waiting for your code. Tap to open it.',
+            data: { token: pending.token },
+          },
+          trigger: null,
+        });
+      } catch {
+        /* a dropped poll just means the next tick tries again */
+      }
+    };
+
+    void tick();
+    const id = setInterval(tick, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [phase]);
+
+  // A tapped notification carries the already-signed token, so the
+  // Authenticator screen opens straight to the code instead of the scanner.
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const token = response.notification.request.content.data?.token;
+      if (typeof token === 'string') nav.push({ name: 'authenticator', token });
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /*
@@ -242,6 +315,7 @@ export default function App() {
         {route.name === 'timeline' && <Timeline txId={route.txId} nav={nav} />}
         {route.name === 'receive' && <Receive nav={nav} onRefresh={refreshMe} />}
         {route.name === 'scan' && <Scan nav={nav} />}
+        {route.name === 'authenticator' && <Authenticator token={route.token} nav={nav} />}
         {route.name === 'settings' && (
           <Settings
             me={me}

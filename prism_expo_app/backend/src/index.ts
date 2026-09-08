@@ -18,6 +18,7 @@ import { ensureAppSchema } from './schema';
 import { errorHandler } from '../../../backend/src/api/middleware/errorHandler';
 import pool from '../../../backend/src/db/pool';
 import redis from '../../../backend/src/utils/redis';
+import { keyManager } from '../../../backend/src/modules/keys/keyManager';
 
 const PORT = Number(process.env.APP_API_PORT ?? 4100);
 
@@ -39,6 +40,18 @@ app.get('/health', async (_req, res) => {
   } catch (err) {
     res.status(503).json({ ok: false, error: (err as Error).message });
   }
+});
+
+/**
+ * Mirrors the web backend's `/.well-known/prism-keys` on this server's own
+ * port. The phone only knows one API base (this one), so the signed
+ * step-up challenge it verifies has to be checkable without also knowing the
+ * web backend's address. Same key, same public-only response — no session
+ * guard, because verification needs nothing secret.
+ */
+app.get('/.well-known/prism-keys', async (_req, res) => {
+  const key = await keyManager.qrPublicKey();
+  res.json({ keys: [key] });
 });
 
 app.use('/app/v1', router);
