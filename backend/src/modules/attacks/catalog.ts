@@ -17,7 +17,8 @@ export type ScenarioId =
   | 'FORGED_WEBAUTHN_ASSERTION'
   | 'SESSION_JWT_TAMPER'
   | 'STEPUP_BRUTEFORCE'
-  | 'QR_OVERLAY_SWAP';
+  | 'QR_OVERLAY_SWAP'
+  | 'QR_REPLAY';
 
 export type ScenarioCategory =
   | 'Transaction Integrity'
@@ -290,6 +291,43 @@ export const CATALOG: Record<ScenarioId, ScenarioDefinition> = {
     ],
     limitations: [
       'A customer who does not read the recipient name before approving is not protected by this control alone — PRISM exposes the true identity truthfully; a human still has to look at it. The same honest limitation the semantic step-up documents for social engineering applies here.',
+    ],
+  },
+
+  QR_REPLAY: {
+    id: 'QR_REPLAY',
+    name: 'QR Code Replay',
+    category: 'Replay & Ledger',
+    severity: 'HIGH',
+    whatItIs:
+      'An attacker photographs or intercepts a PRISM payment QR the payee displayed, then re-presents the identical token, hoping to lock a second payment against the same request — the way a static, printed QR sticker can be paid over and over.',
+    howItAffectsTheModel:
+      'PRISM claims a QR is an authenticated, single-use POINTER, never reusable payment data (novelty N3). If the same token could be scanned twice, the QR would be a bearer instrument an attacker could copy and spend repeatedly.',
+    attackerGoal:
+      'Get a second, unintended payment locked from a QR token that was already scanned once, by replaying it verbatim.',
+    expectedDetectionLayer: 'Dynamic QR single-use guard (Intent layer)',
+    expectedDetectionFiles: [
+      'backend/src/modules/qr/dynamicQr.ts (atomic GETSET marks the request CONSUMED on first scan)',
+      'backend/src/api/routes.ts (POST /qr/scan)',
+    ],
+    preconditions: [
+      'A second real account exists to mint the request from, so the scanned token resolves a genuine payee — exactly the shape of a shop displaying its own code',
+    ],
+    expectedOutcome:
+      'The first scan locks one intent; the identical replay is refused with failureCode QR_ALREADY_USED before it can resolve a payee or lock anything. The request is spent exactly once.',
+    mechanism:
+      'The engine mints a QR request as a real payee, scans it once as the target payer (which succeeds and locks an intent), then submits the identical token to POST /qr/scan a second time and shows it refused by the single-use guard.',
+    attackerDevice:
+      'The device holding the captured QR token — models an attacker who copied a displayed or intercepted code, not one who compromised an account.',
+    targetDescription:
+      'A freshly minted, single-use QR request. This is a token-level attack: it needs no signing and no pre-existing live transaction.',
+    usesVictimSession: true,
+    usesAttackerSession: false,
+    assumptions: [
+      'A clean first scan is needed for the replay to be meaningful. If the minted token cannot be scanned successfully on this run (for example it was already consumed on a shared backend), the run reports SIMULATED rather than forcing a result.',
+    ],
+    limitations: [
+      'This proves the token cannot be REUSED. It does not address a swapped-sticker attack, where a different valid token points at the attacker — that is covered by the payee being read from server records at scan time, demonstrated separately.',
     ],
   },
 };

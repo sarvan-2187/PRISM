@@ -23,6 +23,7 @@ import { forgedWebauthnAssertion } from './attackers/forgedWebauthnAssertion';
 import { sessionJwtTamper } from './attackers/sessionJwtTamper';
 import { stepUpBruteforce } from './attackers/stepUpBruteforce';
 import { qrOverlaySwap } from './attackers/qrOverlaySwap';
+import { qrReplay } from './attackers/qrReplay';
 import { runLegitPayment } from './legitPayment';
 import { getUser, getKnownPayee, getNeverPaidPayee, getTransaction } from './demoData';
 import { audit } from '../audit/logger';
@@ -43,6 +44,7 @@ const ATTACKERS: Record<ScenarioId, AttackFn> = {
   SESSION_JWT_TAMPER: sessionJwtTamper,
   STEPUP_BRUTEFORCE: stepUpBruteforce,
   QR_OVERLAY_SWAP: qrOverlaySwap,
+  QR_REPLAY: qrReplay,
 };
 
 function makeContext(runId: string, attackerLabel: string): AttackContext {
