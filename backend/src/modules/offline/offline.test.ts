@@ -1,27 +1,35 @@
 /**
  * Self-check for offline authorization.  Run: npm run test:offline
  *
- * BLACKOUT (FC-01-A): the device goes fully offline mid-payment. This pins
- * the two properties the card demands — a voucher still authenticates with
- * no server, and a captured voucher cannot be replayed once the link is
- * back — plus the tamper/expiry/revocation edges around them.
+ * BLACKOUT (FC-01-A): a payment is under way, the device drops offline
+ * mid-flight, and authentication must still complete locally and stay
+ * replay-proof when connectivity returns.
  *
- * Needs Postgres and Redis running (docker compose up -d) and the seed
- * applied (npm run db:seed) — Asha must have settled history with Priya, or
- * the grant has no allowed payee to test against.
+ * The scenario each case exercises is the real one: a transaction is locked
+ * ONLINE the ordinary way (the same intentLock.lock() every payment uses),
+ * then approved with no server — a signature over the intent hash the
+ * server already handed over — and redeemed afterwards.
  *
- * Drives the modules directly (not over HTTP): offline.redeem() needs only
- * an Express-shaped Request, which a plain object satisfies. Every row this
- * creates is deleted on exit and account balances are restored.
+ * Case 3 is the one that was broken: an approval that arrives after the
+ * 90-second intent window has closed. Every real blackout outlives that
+ * window, so rejecting it made the whole feature unusable.
+ *
+ * Needs Postgres and Redis (docker compose up -d) and the seed applied.
+ * Every row this creates is deleted on exit and balances are restored.
  */
 import assert from 'node:assert/strict';
+import crypto from 'crypto';
 import type { Request } from 'express';
-import pool, { query } from '../../db/pool';
+import pool, { query, getClient } from '../../db/pool';
 import redis from '../../utils/redis';
 import { offlineGrant, GrantBody } from './grant';
 import { offlineRedeem } from './redeem';
-import { intentHash as computeIntentHash, LockedIntent } from '../../utils/canonical';
+import { intentLock } from '../intent/intentLock';
+import { attestationChain } from '../attestation/chain';
+import { intentHash } from '../../utils/canonical';
+import { generateNonce } from '../../utils/crypto';
 import { PrismError } from '../../api/errors';
+import { policy } from '../../config/policy';
 import { createSoftCredential, SoftCredential } from '../identity/softAuthenticator';
 
 const rejectsWith = (code: string) => (err: unknown) => {
@@ -30,11 +38,7 @@ const rejectsWith = (code: string) => (err: unknown) => {
   return true;
 };
 
-const CLEANUP = {
-  txIds: [] as string[],
-  grantIds: [] as string[],
-  credIds: [] as string[],
-};
+const CLEANUP = { txIds: [] as string[], grantIds: [] as string[], credIds: [] as string[] };
 
 let ashaUserId = '';
 let ashaAccountId = '';
@@ -54,29 +58,96 @@ function fakeReq(userId: string, body: unknown): Request {
   } as unknown as Request;
 }
 
-/** Build, hash and sign a voucher body from one slot of a grant. */
-function buildVoucher(
-  grant: GrantBody,
-  token: string,
-  slotIndex: number,
-  signer: SoftCredential,
-  overrides: Partial<LockedIntent> = {}
-): { token: string; intent: LockedIntent; intentHash: string; assertion: ReturnType<SoftCredential['sign']> } {
-  const slot = grant.slots[slotIndex];
-  const intent: LockedIntent = {
-    amountMinor: 200000, // ₹2,000 — under the ₹5,000 cap
-    createdAt: Math.floor(Date.now() / 1000),
-    currency: grant.currency,
-    expiresAt: Math.floor(Date.now() / 1000) + 900,
+/** Lock a payment the ordinary ONLINE way — exactly what /payment/initiate does. */
+async function lockPayment(payeeAccountId: string, amountMinor: number) {
+  const locked = await intentLock.lock({
+    payerUserId: ashaUserId,
+    payerAccountId: ashaAccountId,
+    payeeAccountId,
+    amountMinor,
+  });
+  CLEANUP.txIds.push(locked.txId);
+  return locked;
+}
+
+/**
+ * The same lock, but as it would look `agoSeconds` in the past.
+ *
+ * It has to be built this way rather than by UPDATE-ing the timestamps
+ * afterwards: createdAt and expiresAt are inside the intent hash, so editing
+ * them post-hoc makes the row stop hashing to its own intent_hash and
+ * verifyHash correctly refuses it. Mirrors intentLock.lock() — row, chain
+ * root and reserved nonce — with an older clock.
+ */
+async function lockPaymentInThePast(payeeAccountId: string, amountMinor: number, agoSeconds: number) {
+  const txId = crypto.randomUUID();
+  const nonce = generateNonce();
+  const createdAt = Math.floor(Date.now() / 1000) - agoSeconds;
+  const expiresAt = createdAt + policy.intentTtlSeconds;
+  const hash = intentHash({
+    amountMinor,
+    createdAt,
+    currency: policy.currency,
+    expiresAt,
     lockVersion: 1,
-    nonce: slot.nonce,
-    payeeAccountId: priyaAccountId,
-    payerUserId: grant.payerUserId,
-    txId: slot.txId,
-    ...overrides,
+    nonce,
+    payeeAccountId,
+    payerUserId: ashaUserId,
+    txId,
+  });
+
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO transactions
+         (id, payer_user_id, payer_account_id, payee_account_id, amount_minor,
+          currency, intent_hash, nonce, lock_version, created_at, expires_at, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,to_timestamp($9),to_timestamp($10),'PENDING')`,
+      [
+        txId,
+        ashaUserId,
+        ashaAccountId,
+        payeeAccountId,
+        amountMinor,
+        policy.currency,
+        hash,
+        nonce,
+        createdAt,
+        expiresAt,
+      ]
+    );
+    await attestationChain.append(
+      txId,
+      'INTENT_LOCKED',
+      { amountMinor, payeeAccountId, currency: policy.currency, createdAt, expiresAt },
+      { client }
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  await redis.set(`nonce:${nonce}`, 'RESERVED', 'EX', policy.nonceTtlSeconds);
+
+  CLEANUP.txIds.push(txId);
+  return { txId, intentHash: hash };
+}
+
+/**
+ * What the device does during the blackout: sign the intent hash it already
+ * holds. No network, no server-side state, nothing invented locally.
+ */
+function signOffline(token: string, txId: string, intentHash: string, signer: SoftCredential) {
+  return {
+    token,
+    txId,
+    intentHash,
+    assertion: signer.sign(intentHash),
+    approvedAt: Math.floor(Date.now() / 1000),
   };
-  const hash = computeIntentHash(intent);
-  return { token, intent, intentHash: hash, assertion: signer.sign(hash) };
 }
 
 async function setup(): Promise<void> {
@@ -112,136 +183,146 @@ async function setup(): Promise<void> {
 async function main(): Promise<void> {
   await setup();
 
-  // 1. Happy path: a voucher signed with no network reaches SETTLED.
-  {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
-    assert.ok(
-      grant.allowedPayees.some((p) => p.accountId === priyaAccountId),
-      'setup: Priya must be an allowed offline payee (seed gives Asha settled history with her)'
-    );
-    // >= 1 rather than exactly 1: a shared dev/demo database may already have
-    // other non-duress passkeys registered for Asha (a browser registration,
-    // an earlier e2e run). The property under test is that ours is included.
-    assert.ok(
-      grant.credentialIds.includes(cred.credentialId),
-      "grant pins this session's active non-duress credential"
-    );
+  const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
+  CLEANUP.grantIds.push(grant.grantId);
+  assert.ok(
+    grant.allowedPayees.some((p) => p.accountId === priyaAccountId),
+    'setup: Priya must be an allowed offline payee (the seed gives Asha settled history with her)'
+  );
+  assert.ok(
+    grant.credentialIds.includes(cred.credentialId),
+    "grant pins this session's active non-duress credential"
+  );
 
-    const voucher = buildVoucher(grant, token, 0, cred);
+  // 1. The card's actual scenario: locked online, approved with no server,
+  //    settles on reconnect.
+  {
+    const locked = await lockPayment(priyaAccountId, 200000); // ₹2,000
+    const voucher = signOffline(token, locked.txId, locked.intentHash, cred);
     const result = await offlineRedeem.redeem(fakeReq(ashaUserId, voucher));
-    CLEANUP.txIds.push(result.txId);
-    assert.equal(result.decision, 'APPROVED', '1: offline voucher settles');
+    assert.equal(result.decision, 'APPROVED', '1: an offline approval settles on reconnect');
 
     const tx = await query<{ status: string; authorized_offline: boolean }>(
       `SELECT status, authorized_offline FROM transactions WHERE id = $1`,
-      [result.txId]
+      [locked.txId]
     );
     assert.equal(tx.rows[0].status, 'SETTLED', '1: status SETTLED');
-    assert.equal(tx.rows[0].authorized_offline, true, '1: flagged as an offline authorization');
+    assert.equal(tx.rows[0].authorized_offline, true, '1: flagged as authorized offline');
 
-    // 2. Replay: the exact same captured voucher, resubmitted after "reconnect".
+    // 2. Replay: the same captured voucher, resubmitted after reconnect.
     await assert.rejects(
       () => offlineRedeem.redeem(fakeReq(ashaUserId, voucher)),
       rejectsWith('REPLAY_BLOCKED'),
-      '2: a captured voucher cannot be redeemed twice'
+      '2: a captured offline approval cannot be redeemed twice'
     );
   }
 
-  // 3. Tamper: amount edited after signing, hash left as the original.
+  // 3. THE REGRESSION: the blackout outlasted the 90-second intent window.
+  //    This is what made every honest offline payment fail before.
   {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
-    const voucher = buildVoucher(grant, token, 0, cred);
-    CLEANUP.txIds.push(voucher.intent.txId); // no-op if redeem() never reaches the insert
-    const tampered = { ...voucher, intent: { ...voucher.intent, amountMinor: 300000 } };
+    const locked = await lockPaymentInThePast(
+      priyaAccountId,
+      150000, // ₹1,500
+      policy.intentTtlSeconds + 120
+    );
+    const aged = await intentLock.get(locked.txId);
+    assert.equal(intentLock.isExpired(aged), true, "3: setup — the intent's own window has closed");
+
+    const voucher = signOffline(token, locked.txId, locked.intentHash, cred);
+    const result = await offlineRedeem.redeem(fakeReq(ashaUserId, voucher));
+    assert.equal(
+      result.decision,
+      'APPROVED',
+      '3: an approval older than the intent window still settles'
+    );
+    assert.ok(result.lateBySeconds > 0, '3: the lag is measured and reported, not hidden');
+  }
+
+  // 4. Tamper: a voucher pointed at a different transaction than the one
+  //    whose hash was signed.
+  {
+    const a = await lockPayment(priyaAccountId, 100000);
+    const b = await lockPayment(priyaAccountId, 400000);
+    const crossed = signOffline(token, b.txId, a.intentHash, cred);
     await assert.rejects(
-      () => offlineRedeem.redeem(fakeReq(ashaUserId, tampered)),
+      () => offlineRedeem.redeem(fakeReq(ashaUserId, crossed)),
       rejectsWith('TAMPER_BLOCKED'),
-      '3: amount edited post-signature must not settle'
+      '4: a hash from another transaction cannot authorize this one'
     );
   }
 
-  // 4. Payee outside the offline allow-list (never settled with Asha before).
+  // 5. A payee the grant never covered (never settled with, so not on the
+  //    allow-list) cannot be paid offline at all.
   {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
+    const locked = await lockPayment(rajeshAccountId, 100000);
     assert.ok(
       !grant.allowedPayees.some((p) => p.accountId === rajeshAccountId),
-      'setup: Rajesh must NOT be an allowed offline payee (no settled history)'
+      'setup: Rajesh must NOT be an allowed offline payee'
     );
-    const voucher = buildVoucher(grant, token, 0, cred, { payeeAccountId: rajeshAccountId });
-    CLEANUP.txIds.push(voucher.intent.txId);
+    const voucher = signOffline(token, locked.txId, locked.intentHash, cred);
     await assert.rejects(
       () => offlineRedeem.redeem(fakeReq(ashaUserId, voucher)),
       rejectsWith('TAMPER_BLOCKED'),
-      '4: a payee outside the grant cannot be paid offline'
+      '5: a payee outside the grant cannot be paid offline'
     );
   }
 
-  // 5. Amount over the offline cap.
+  // 6. Over the offline cap.
   {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
-    const voucher = buildVoucher(grant, token, 0, cred, { amountMinor: grant.maxAmountMinor + 100 });
-    CLEANUP.txIds.push(voucher.intent.txId);
+    const locked = await lockPayment(priyaAccountId, grant.maxAmountMinor + 100);
+    const voucher = signOffline(token, locked.txId, locked.intentHash, cred);
     await assert.rejects(
       () => offlineRedeem.redeem(fakeReq(ashaUserId, voucher)),
       rejectsWith('TAMPER_BLOCKED'),
-      '5: a voucher over the cap cannot settle'
+      '6: an amount over the sealed cap cannot settle offline'
     );
   }
 
-  // 6. Expired grant. Unit-tested directly against assertLive(): a signed
-  // token embeds its own notAfter (MAC'd, so a real expiry cannot be waited
-  // out in seconds here) — this exercises exactly the comparison redeem()
-  // runs against that embedded value.
+  // 7. Grant past its window AND its reconnect grace.
   {
-    const { grant } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
-    const expired: GrantBody = { ...grant, notAfter: Math.floor(Date.now() / 1000) - 10 };
+    const dead: GrantBody = {
+      ...grant,
+      notAfter: Math.floor(Date.now() / 1000) - policy.offline.redeemGraceSeconds - 10,
+    };
     await assert.rejects(
-      () => offlineGrant.assertLive(expired),
+      () => offlineGrant.assertLive(dead),
       rejectsWith('GRANT_EXPIRED'),
-      '6: a grant past its window is refused'
+      '7: a grant past its window and grace is refused'
     );
+    // ...but still live inside the grace, which is what lets a slow
+    // reconnect settle at all.
+    const late: GrantBody = { ...grant, notAfter: Math.floor(Date.now() / 1000) - 5 };
+    await offlineGrant.assertLive(late);
   }
 
-  // 7. Grant body edited, MAC left as the original's.
+  // 8. Grant body edited, MAC left as the original's.
   {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
     const [bodyB64, mac] = token.split('.');
     const edited: GrantBody = { ...grant, maxAmountMinor: 100_00_00000 };
-    const forgedToken = `${Buffer.from(JSON.stringify(edited), 'utf8').toString('base64url')}.${mac}`;
-    assert.notEqual(forgedToken, token, 'sanity: the forged token must actually differ');
-    assert.throws(() => offlineGrant.verify(forgedToken), rejectsWith('GRANT_INVALID'), '7: MAC catches the edit');
-    // A syntactically valid but never-issued token, same check.
+    const forged = `${Buffer.from(JSON.stringify(edited), 'utf8').toString('base64url')}.${mac}`;
+    assert.throws(
+      () => offlineGrant.verify(forged),
+      rejectsWith('GRANT_INVALID'),
+      '8: MAC catches the edit'
+    );
     assert.throws(
       () => offlineGrant.verify(`${bodyB64}.not-a-real-mac`),
       rejectsWith('GRANT_INVALID'),
-      '7b: a forged MAC is refused'
+      '8b: a forged MAC is refused'
     );
   }
 
-  // 8. Revocation after the grant was issued but before redemption — the
-  // stolen-device response. The credential was valid when the grant pinned
-  // it (so it clears the grant-boundary check); revoking it must still stop
-  // a voucher that credential already signed from settling.
+  // 9. Revoked after arming, before redemption — the stolen-device response
+  //    still wins over an approval that credential already signed.
   {
-    const { grant, token } = await offlineGrant.issue(ashaUserId, ashaAccountId);
-    CLEANUP.grantIds.push(grant.grantId);
-    const voucher = buildVoucher(grant, token, 0, cred);
-    // Unlike cases 3-5, this one fails AFTER the transaction row is inserted
-    // (the signature check runs later than the envelope/hash checks — see
-    // redeem.ts), so this id is real and must be cleaned up, not a no-op.
-    CLEANUP.txIds.push(voucher.intent.txId);
+    const locked = await lockPayment(priyaAccountId, 100000);
+    const voucher = signOffline(token, locked.txId, locked.intentHash, cred);
     await query(`UPDATE credentials SET revoked_at = NOW() WHERE id = $1`, [cred.credentialId]);
     try {
       await assert.rejects(
         () => offlineRedeem.redeem(fakeReq(ashaUserId, voucher)),
         rejectsWith('AUTH_FAILED'),
-        '8: a captured voucher signed by a now-revoked credential must not settle'
+        '9: a voucher signed by a now-revoked credential must not settle'
       );
     } finally {
       await query(`UPDATE credentials SET revoked_at = NULL WHERE id = $1`, [cred.credentialId]);
@@ -257,28 +338,28 @@ async function cleanup(): Promise<void> {
     await query(`DELETE FROM settlement_capabilities WHERE transaction_id = ANY($1)`, [txIds]);
     await query(`DELETE FROM authorization_steps WHERE transaction_id = ANY($1)`, [txIds]);
     await query(`DELETE FROM ledger_entries WHERE transaction_id = ANY($1)`, [txIds]);
+    await query(`DELETE FROM offline_vouchers WHERE tx_id = ANY($1)`, [txIds]);
   }
   if (grantIds.length) {
     await query(`DELETE FROM offline_vouchers WHERE grant_id = ANY($1)`, [grantIds]);
   }
   if (txIds.length) {
-    // redeem() audits several stages against these transaction ids
-    // (CONTEXT_EVALUATED, SETTLEMENT_AUTHORIZED, OFFLINE_VOUCHER_REDEEMED, ...);
-    // audit_logs.transaction_id FKs to transactions, so it must clear first.
     await query(`DELETE FROM audit_logs WHERE transaction_id = ANY($1)`, [txIds]);
     await query(`DELETE FROM transactions WHERE id = ANY($1)`, [txIds]);
   }
-  if (grantIds.length) {
-    await query(`DELETE FROM offline_grants WHERE id = ANY($1)`, [grantIds]);
-  }
-  if (credIds.length) {
-    await query(`DELETE FROM credentials WHERE id = ANY($1)`, [credIds]);
-  }
+  if (grantIds.length) await query(`DELETE FROM offline_grants WHERE id = ANY($1)`, [grantIds]);
+  if (credIds.length) await query(`DELETE FROM credentials WHERE id = ANY($1)`, [credIds]);
   if (ashaAccountId) {
-    await query('UPDATE accounts SET balance_minor = $2 WHERE id = $1', [ashaAccountId, ashaBalance0.toString()]);
+    await query('UPDATE accounts SET balance_minor = $2 WHERE id = $1', [
+      ashaAccountId,
+      ashaBalance0.toString(),
+    ]);
   }
   if (priyaAccountId) {
-    await query('UPDATE accounts SET balance_minor = $2 WHERE id = $1', [priyaAccountId, priyaBalance0.toString()]);
+    await query('UPDATE accounts SET balance_minor = $2 WHERE id = $1', [
+      priyaAccountId,
+      priyaBalance0.toString(),
+    ]);
   }
 }
 
@@ -286,10 +367,6 @@ main()
   .then(cleanup)
   .then(async () => {
     await pool.end();
-    // redis (ioredis) holds an open TCP connection that keeps the event loop
-    // alive indefinitely; chain.test.ts never hits this because it never
-    // imports anything that touches redis. Close it explicitly so the
-    // process exits on success the same way it already does on failure.
     redis.disconnect();
   })
   .catch(async (err) => {

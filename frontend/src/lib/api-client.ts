@@ -260,7 +260,7 @@ export const api = {
 
   // ── Offline authorization (BLACKOUT / FC-01-A) ─────────────────────
   // Arm while online — nothing below this point needs a network call before
-  // a blackout. See lib/offline-intent.ts and lib/offline-store.ts.
+  // a blackout. See lib/offline-store.ts and lib/offline-sync.ts.
 
   /** Arm this device: a capped, payee-restricted, single-use-slot grant. */
   offlineGrantIssue: () =>
@@ -270,12 +270,17 @@ export const api = {
     request<{ armed: boolean; grantId?: string; notAfter?: string; slots?: number }>(
       '/offline/grant'
     ),
-  /** Redeem a voucher produced while offline. Runs live risk + policy on reconnect. */
+  /**
+   * Redeem an approval signed during a blackout. The voucher names an
+   * ordinary transaction that was already locked online — this authorizes
+   * that same payment, and the server re-runs live risk and policy first.
+   */
   offlineRedeem: (voucher: {
     token: string;
-    intent: unknown;
+    txId: string;
     intentHash: string;
     assertion: unknown;
+    approvedAt?: number;
   }) =>
     request<{
       decision: 'APPROVED';
@@ -285,6 +290,7 @@ export const api = {
       balanceMinor: number;
       balanceFormatted: string;
       txId: string;
+      lateBySeconds: number;
     }>('/offline/redeem', { method: 'POST', body: JSON.stringify(voucher) }),
 
   // ── Authenticator (paired second device) ─────────────────────────────

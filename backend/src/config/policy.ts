@@ -143,12 +143,22 @@ export const policy = {
    * slots * maxAmountMinor, to already-known payees only, inside one window.
    */
   offline: {
-    /** Pre-reserved single-use nonces per grant. Bounds how many offline payments one grant can cover. */
-    slots: 3,
     /** Per-payment cap while offline — well under AMOUNT_ANOMALY, so a stolen device cannot make it look ordinary either. */
     maxAmountMinor: 500000, // ₹5,000
-    /** How long a grant stays spendable after arming. */
+    /** How long after arming the device may still approve a payment offline. Bounds a stolen armed device. */
     windowSeconds: 900, // 15 minutes
+    /**
+     * Extra time, after the grant window closes, in which a voucher already
+     * produced may still be submitted.
+     *
+     * This is the knob that replaces intentTtlSeconds for an offline
+     * approval, and it has to exist: the intent window is 90 seconds, which
+     * no real blackout respects. A voucher redeemed here is deliberately
+     * allowed to reference an intent whose own window closed — the grant
+     * window is what bounds it instead, and the lag is recorded on the
+     * authorization chain rather than hidden.
+     */
+    redeemGraceSeconds: 900, // 15 minutes
   },
 } as const;
 

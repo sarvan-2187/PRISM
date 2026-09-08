@@ -1,37 +1,46 @@
 /**
- * Offline Authorization Voucher — redemption — BLACKOUT (FC-01-A).
+ * Offline authorization voucher — redemption — BLACKOUT (FC-01-A).
  *
- * A voucher is what the device produced while it had no network: a signed
- * grant, the exact LockedIntent it built from one of that grant's slots, the
- * hash it computed from that intent, and a WebAuthn assertion signed over
- * that hash. This module is what runs when connectivity returns.
+ * The card: "the device goes fully offline mid-payment. Authentication must
+ * still complete locally and stay replay-proof when connectivity returns."
  *
- * An offline approval is a proof of authenticity, not a promise of
- * settlement. This redeems the proof — who approved exactly what, on which
- * device, without a server — and then, only now that the server can ask
- * anything again, runs the SAME risk engine and policy firewall the online
- * path runs, live. A voucher can be authentic and still be denied here; that
- * is what stops "offline mode" from being a bypass.
+ * So this is the SAME payment, not a different one. A payment is initiated
+ * online in the ordinary way (POST /payment/initiate), which locks the
+ * intent, computes the intent hash server-side, and hands that hash to the
+ * browser. If the network dies before the payer taps Approve, the device
+ * already holds everything it needs: the passkey prompt is local hardware,
+ * and the challenge it signs — the intent hash — was handed over while the
+ * link was still up. Nothing has to be invented offline.
  *
- * Order of checks mirrors api/routes.ts's authorize pipeline as closely as
- * the two flows allow: cheapest and least-trusting checks first, and only
- * the last step moves money.
+ * A voucher is therefore just: which transaction, the hash the device
+ * signed, the assertion, and the grant proving this device was armed while
+ * online. This module authorizes that already-locked transaction.
  *
- *   1. Grant MAC + shape             -> GRANT_INVALID
- *   2. Grant not expired/revoked     -> GRANT_EXPIRED
- *   3. Reserve the voucher's nonce   -> REPLAY_BLOCKED  (a DB UNIQUE constraint)
- *   4. Intent fits inside the grant  -> TAMPER_BLOCKED  (envelope + slot match)
- *   5. Recomputed hash matches       -> TAMPER_BLOCKED  (utils/canonical.ts, same function online uses)
- *   6. Assertion verifies            -> SIG_INVALID
- *   7. Risk + policy, run live       -> RISK_BLOCKED / POLICY_DENIED / STEP_UP_FAILED
- *   8. Settle                        -> the normal ACID path, unmodified
+ * Order of checks (cheapest and least-trusting first; only the last step
+ * moves money):
+ *
+ *   1. Grant MAC + shape              -> GRANT_INVALID
+ *   2. Grant window + reconnect grace -> GRANT_EXPIRED
+ *   3. Load the REAL transaction, check ownership and terminal state
+ *   4. Reserve the transaction's nonce -> REPLAY_BLOCKED (a DB UNIQUE constraint)
+ *   5. Intent still hashes to what was signed -> TAMPER_BLOCKED
+ *   6. Payment fits the grant's envelope      -> TAMPER_BLOCKED
+ *   7. Assertion verifies over that hash      -> SIG_INVALID
+ *   8. Risk + policy, re-run LIVE             -> RISK_BLOCKED / POLICY_DENIED
+ *   9. Settle through the normal ACID path
+ *
+ * What is deliberately NOT checked: intentLock.isExpired(). The intent
+ * window is 90 seconds and no real blackout respects it — enforcing it here
+ * would reject every honest offline approval, which is exactly the bug this
+ * rewrite fixes. The grant window plus its reconnect grace bounds the
+ * voucher instead, and the lag is recorded on the chain rather than hidden.
  */
 import { Request } from 'express';
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server/script/deps';
-import { getClient, query } from '../../db/pool';
-import { AuthorizationStage, TransactionRow, formatMinor } from '../../db/types';
-import { intentHash as computeIntentHash, hashesMatch, LockedIntent } from '../../utils/canonical';
-import { fail, PrismError } from '../../api/errors';
+import { query } from '../../db/pool';
+import { AuthorizationStage, formatMinor } from '../../db/types';
+import { hashesMatch } from '../../utils/canonical';
+import { fail, PrismError, FAILURES, FailureCode } from '../../api/errors';
 import { offlineGrant, GrantBody } from './grant';
 import { identity } from '../identity/webauthn';
 import { attestationChain } from '../attestation/chain';
@@ -43,7 +52,7 @@ import { intentLock } from '../intent/intentLock';
 import { audit } from '../audit/logger';
 import { policy } from '../../config/policy';
 
-/** Every stage an offline settlement must have before it can settle — same shape as routes.ts's REQUIRED_STAGES, minus SEMANTIC_VERIFIED (see step 7 below: offline vouchers cannot complete an interactive step-up, so REQUIRE_SEMANTIC is a hard failure here rather than a detour). */
+/** Same stages the online authorize path requires before settlement. */
 const REQUIRED_STAGES: AuthorizationStage[] = [
   'INTENT_LOCKED',
   'WEBAUTHN_APPROVED',
@@ -61,54 +70,63 @@ export interface RedeemResult {
   balanceMinor: number;
   balanceFormatted: string;
   txId: string;
+  /** Seconds between the intent's own expiry and this redemption. Display + audit only. */
+  lateBySeconds: number;
 }
 
 async function markVoucherOutcome(
   nonce: string,
   outcome: 'SETTLED' | 'FAILED',
-  failureCode: string | null,
-  txId: string | null
+  failureCode: string | null
 ): Promise<void> {
-  await query(
-    `UPDATE offline_vouchers SET outcome = $2, failure_code = $3, tx_id = COALESCE($4, tx_id) WHERE nonce = $1`,
-    [nonce, outcome, failureCode, txId]
-  );
+  await query(`UPDATE offline_vouchers SET outcome = $2, failure_code = $3 WHERE nonce = $1`, [
+    nonce,
+    outcome,
+    failureCode,
+  ]);
 }
 
 export class OfflineRedeemModule {
   async redeem(req: Request): Promise<RedeemResult> {
     const userId = req.userId!;
     const token = String(req.body.token ?? '');
-    const intent = req.body.intent as LockedIntent;
+    const txId = String(req.body.txId ?? '');
     const claimedHash = String(req.body.intentHash ?? '');
     const assertion = req.body.assertion as AuthenticationResponseJSON;
 
-    // 1. Grant MAC + shape.
+    if (!txId) fail('TAMPER_BLOCKED', { reason: 'voucher names no transaction' });
+
+    // 1 + 2. The grant: proof this device was armed while online, and the
+    // only time bound that applies to an offline approval.
     const grant: GrantBody = offlineGrant.verify(token);
-
-    // 2. Freshness / revocation.
     await offlineGrant.assertLive(grant);
-
     if (grant.payerUserId !== userId) {
-      // Not this session's grant. Treated as a tamper attempt, not a 404 —
-      // the grant is structurally valid, just not this payer's to spend.
       fail('TAMPER_BLOCKED', { reason: 'grant does not belong to this session' });
     }
 
-    if (!intent || typeof intent !== 'object') {
-      fail('TAMPER_BLOCKED', { reason: 'missing or malformed intent' });
+    // 3. The real, already-locked transaction — the same row the online
+    // path would have authorized.
+    const tx = await intentLock.get(txId);
+    if (tx.payer_user_id !== userId) fail('NOT_FOUND');
+    if (tx.status === 'SETTLED' || tx.status === 'DURESS_HELD') {
+      fail('REPLAY_BLOCKED', { reason: 'this payment has already settled' });
     }
-    const nonce = String(intent.nonce ?? '');
-    if (!nonce) fail('TAMPER_BLOCKED', { reason: 'intent has no nonce' });
+    if (tx.status === 'BLOCKED' || tx.status === 'EXPIRED' || tx.status === 'SUPERSEDED') {
+      const code: FailureCode =
+        tx.failure_code && tx.failure_code in FAILURES
+          ? (tx.failure_code as FailureCode)
+          : 'RISK_BLOCKED';
+      fail(code, { reason: `transaction is already terminal (${tx.status})` });
+    }
 
-    // 3. Reserve the voucher's nonce. This INSERT is the replay defence: the
-    // UNIQUE constraint on offline_vouchers.nonce means the same captured
-    // voucher can cross this line exactly once, ever — enforced by the
-    // database, not by a check that a code change could accidentally skip.
+    // 4. Replay defence. The transaction's OWN nonce is the key: one
+    // transaction, one offline redemption, ever — enforced by the UNIQUE
+    // constraint on offline_vouchers.nonce, not by a check above it. A
+    // captured voucher resubmitted after the link is back dies right here.
     try {
       await query(
-        `INSERT INTO offline_vouchers (grant_id, nonce, outcome) VALUES ($1, $2, 'PENDING')`,
-        [grant.grantId, nonce]
+        `INSERT INTO offline_vouchers (grant_id, nonce, tx_id, outcome) VALUES ($1, $2, $3, 'PENDING')`,
+        [grant.grantId, tx.nonce, tx.id]
       );
     } catch (err) {
       if ((err as { code?: string }).code === '23505') {
@@ -117,139 +135,74 @@ export class OfflineRedeemModule {
       throw err;
     }
 
-    let txId: string | null = null;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const expiresAtSeconds = Math.floor(tx.expires_at.getTime() / 1000);
+    const lateBySeconds = Math.max(0, nowSeconds - expiresAtSeconds);
+
     try {
-      // 4. Intent must sit inside the envelope: a real slot from this grant,
-      // an allowed payee, within the amount cap, for this payer.
-      const slot = grant.slots.find((s) => s.txId === intent.txId && s.nonce === intent.nonce);
-      if (!slot) fail('TAMPER_BLOCKED', { reason: 'txId/nonce is not a slot from this grant' });
-
-      const allowed = grant.allowedPayees.some((p) => p.accountId === intent.payeeAccountId);
-      if (!allowed) fail('TAMPER_BLOCKED', { reason: 'payee is not on the offline allow-list' });
-
-      if (intent.payerUserId !== grant.payerUserId) {
-        fail('TAMPER_BLOCKED', { reason: 'payer does not match the grant' });
+      // 5. The device signed a hash. It must be the hash this transaction
+      // actually has, recomputed by the server from its own columns — the
+      // same verifyHash the online path uses, with the same meaning.
+      if (!claimedHash || !hashesMatch(claimedHash, tx.intent_hash)) {
+        fail('TAMPER_BLOCKED', { reason: "the signed hash is not this transaction's intent hash" });
       }
-      if (intent.currency !== grant.currency) {
+      if (!intentLock.verifyHash(tx, claimedHash)) {
+        fail('TAMPER_BLOCKED', { reason: 'intent hash does not match the locked record' });
+      }
+
+      // 6. The payment has to sit inside the envelope the grant sealed while
+      // the device was still online. The device cannot widen any of this.
+      const allowed = grant.allowedPayees.some((p) => p.accountId === tx.payee_account_id);
+      if (!allowed) {
+        fail('TAMPER_BLOCKED', { reason: "payee is not on this grant's offline allow-list" });
+      }
+      const amountMinor = parseInt(tx.amount_minor, 10);
+      if (amountMinor > grant.maxAmountMinor) {
+        fail('TAMPER_BLOCKED', { reason: 'amount exceeds the offline cap sealed in the grant' });
+      }
+      if (tx.currency !== grant.currency) {
         fail('TAMPER_BLOCKED', { reason: 'currency does not match the grant' });
       }
-      if (intent.lockVersion !== 1) {
-        fail('TAMPER_BLOCKED', { reason: 'unexpected lockVersion' });
-      }
-      if (
-        !Number.isInteger(intent.amountMinor) ||
-        intent.amountMinor <= 0 ||
-        intent.amountMinor > grant.maxAmountMinor
-      ) {
-        fail('TAMPER_BLOCKED', { reason: 'amount exceeds the offline cap or is not a positive integer' });
+
+      // Redis nonce state is a second, independent replay layer. A CONSUMED
+      // nonce means this transaction already settled. A MISSING one is fine
+      // here and only here: its TTL is shorter than the offline window, so
+      // absence means "aged out", not "spent" — the UNIQUE constraint in
+      // step 4 is what actually guarantees single use.
+      const nonceState = await intentLock.nonceState(tx.nonce);
+      if (nonceState === 'CONSUMED') {
+        fail('REPLAY_BLOCKED', { reason: 'nonce already consumed' });
       }
 
-      // 5. Recompute the hash from the intent with the exact function the
-      // online path uses, and compare against what the device claims it
-      // signed. A field edited after signing changes this recomputed hash,
-      // so it stops matching claimedHash right here — cheaply, before any
-      // signature verification runs.
-      let recomputed: string;
-      try {
-        recomputed = computeIntentHash(intent);
-      } catch (err) {
-        fail('TAMPER_BLOCKED', { reason: `intent does not hash: ${(err as Error).message}` });
-        throw err; // unreachable — fail() never returns
-      }
-      if (!hashesMatch(recomputed, claimedHash)) {
-        fail('TAMPER_BLOCKED', { reason: 'recomputed hash does not match the claimed intent hash' });
-      }
-
-      // The transaction row is created here — before the signature is
-      // checked, not after — deliberately mirroring the online flow, where
-      // intentLock.lock() already exists in the database before the WebAuthn
-      // challenge is even issued. Any audit/chain write that names this
-      // transaction (including the assertion check right below) needs a real
-      // row to reference, or its write silently fails on audit_logs' foreign
-      // key — audit.log() swallows that failure so a payment is never
-      // blocked by a logging outage, but it also means a wrong write order
-      // here quietly loses timeline entries instead of erroring loudly.
-      txId = intent.txId;
-      const client = await getClient();
-      try {
-        await client.query('BEGIN');
-        try {
-          await client.query(
-            `INSERT INTO transactions
-               (id, payer_user_id, payer_account_id, payee_account_id, amount_minor, currency,
-                intent_hash, nonce, lock_version, created_at, expires_at, status, authorized_offline)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1, to_timestamp($9), to_timestamp($10), 'PENDING', TRUE)`,
-            [
-              txId,
-              userId,
-              grant.payerAccountId,
-              intent.payeeAccountId,
-              intent.amountMinor,
-              intent.currency,
-              claimedHash,
-              nonce,
-              intent.createdAt,
-              intent.expiresAt,
-            ]
-          );
-        } catch (err) {
-          if ((err as { code?: string }).code === '23505') {
-            fail('REPLAY_BLOCKED', { reason: 'this transaction id or nonce has already settled' });
-          }
-          throw err;
-        }
-        await attestationChain.append(
-          txId,
-          'INTENT_LOCKED',
-          {
-            mode: 'OFFLINE',
-            grantId: grant.grantId,
-            // Device-claimed, not trusted for any gating decision — the real
-            // time bound that binds is grant.notAfter, checked in step 2
-            // against the SERVER's clock. Recorded here so the timeline can
-            // show what the device claimed without the system relying on it.
-            lockedAt: intent.createdAt,
-            redeemedAt: Math.floor(Date.now() / 1000),
-            amountMinor: intent.amountMinor,
-            payeeAccountId: intent.payeeAccountId,
-            currency: intent.currency,
-          },
-          { client }
-        );
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      // 6. Now that the row exists: the assertion must be from a credential
-      // this grant actually pinned (device binding), and must verify over
-      // the exact hash. A failure from here on is recorded against a real
-      // transaction, so the offline_vouchers row and every audit/chain write
-      // below can safely reference txId.
+      // 7. The signature itself, over that exact hash, from a credential
+      // this grant pinned while online (device binding) and that is still
+      // not revoked (the stolen-device response still wins).
       const assertionCredentialId = String(assertion?.id ?? '');
       if (!grant.credentialIds.includes(assertionCredentialId)) {
         fail('SIG_INVALID', { reason: 'credential is not one this grant authorized' });
       }
-      await identity.verifyOfflineAssertion(userId, txId, claimedHash, assertion);
-      await attestationChain.append(txId, 'WEBAUTHN_APPROVED', {
+      await identity.verifyOfflineAssertion(userId, tx.id, tx.intent_hash, assertion);
+
+      // From here this is the online authorize pipeline, unchanged: same
+      // modules, same order, same chain stages. The transaction already
+      // carries its INTENT_LOCKED root from when it was locked online.
+      const attempt = await attestationChain.startAttempt(tx.id);
+      await attestationChain.append(tx.id, 'WEBAUTHN_APPROVED', {
         mode: 'OFFLINE',
         credentialId: assertionCredentialId,
+        grantId: grant.grantId,
+        // Recorded, never trusted: the server cannot observe when the device
+        // actually signed. The grant window is what bounds this.
+        approvedOfflineAtClaimed: Number(req.body.approvedAt) || null,
+        redeemedAt: nowSeconds,
+        lateBySeconds,
         verified: true,
       });
 
-      // Context, risk, policy — the real thing, evaluated now that the
-      // server can be asked. deliberationMs is measured from this row's
-      // created_at (the device-claimed lock moment), so it naturally reads
-      // as "time offline plus time to redeem" rather than triggering a false
-      // HASTY_APPROVAL — an offline approval, by construction, always took a
-      // deliberate local biometric confirmation.
-      const snapshot = context.snapshot(req, { credentialId: assertionCredentialId, txId });
-      const signals = await context.evaluate(userId, snapshot, intent.payeeAccountId, intent.amountMinor);
+      const snapshot = context.snapshot(req, { credentialId: assertionCredentialId, txId: tx.id });
+      const signals = await context.evaluate(userId, snapshot, tx.payee_account_id, amountMinor);
       await audit.log('CONTEXT_EVALUATED', {
-        transactionId: txId,
+        transactionId: tx.id,
         userId,
         data: {
           ...signals,
@@ -260,34 +213,43 @@ export class OfflineRedeemModule {
           networkFamily: snapshot.networkFamily,
           networkPrivate: snapshot.networkPrivate,
           offline: true,
+          lateBySeconds,
         },
       });
-      await attestationChain.append(txId, 'CONTEXT_VERIFIED', { ...signals });
+      await attestationChain.append(tx.id, 'CONTEXT_VERIFIED', { ...signals, offline: true });
 
-      const risk = await riskEngine.evaluate(txId, userId, { ...signals, amountMinor: intent.amountMinor });
+      const risk = await riskEngine.evaluate(tx.id, userId, { ...signals, amountMinor });
       await query(
         `UPDATE transactions SET risk_score = $2, risk_decision = $3, fired_rule_ids = $4 WHERE id = $1`,
-        [txId, risk.score, risk.decision, risk.firedRuleIds]
+        [tx.id, risk.score, risk.decision, risk.firedRuleIds]
       );
-
-      const { rows: txRows } = await query<TransactionRow>('SELECT * FROM transactions WHERE id = $1', [txId]);
-      const tx = txRows[0];
       const scoredTx = { ...tx, risk_score: risk.score };
 
-      const decision = await policyFirewall.evaluate({ tx: scoredTx, signals, isDuressCredential: false });
-      await attestationChain.append(txId, 'POLICY_EVALUATED', {
+      const decision = await policyFirewall.evaluate({
+        tx: scoredTx,
+        signals,
+        isDuressCredential: false,
+      });
+      await attestationChain.append(tx.id, 'POLICY_EVALUATED', {
         outcome: decision.outcome,
         firedRules: decision.firedRules.map((r) => r.id),
         policyVersion: decision.policyVersion,
       });
-      await query(`UPDATE transactions SET policy_version = $2 WHERE id = $1`, [txId, decision.policyVersion]);
+      await query(`UPDATE transactions SET policy_version = $2 WHERE id = $1`, [
+        tx.id,
+        decision.policyVersion,
+      ]);
 
       if (decision.outcome === 'DENY') {
-        await intentLock.markFailed(txId, 'POLICY_DENIED', 'BLOCKED');
+        await intentLock.markFailed(tx.id, 'POLICY_DENIED', 'BLOCKED');
         await audit.log('POLICY_DENIED', {
-          transactionId: txId,
+          transactionId: tx.id,
           userId,
-          data: { firedRules: decision.firedRules.map((r) => r.id), riskScore: risk.score, offline: true },
+          data: {
+            firedRules: decision.firedRules.map((r) => r.id),
+            riskScore: risk.score,
+            offline: true,
+          },
         });
         throw new PrismError(403, 'POLICY_DENIED', 'A payment policy refused this transaction.', {
           rules: decision.firedRules,
@@ -296,29 +258,32 @@ export class OfflineRedeemModule {
       }
 
       if (decision.outcome === 'REQUIRE_SEMANTIC') {
-        // An offline voucher cannot complete an interactive comprehension
-        // check — there is no live device to put the question to. Refusing
-        // is the correct behaviour: this is exactly the "still be denied"
-        // half of "proof of authenticity, not promise of settlement".
-        await intentLock.markFailed(txId, 'STEP_UP_FAILED', 'BLOCKED');
+        // Only reachable for an amended intent. An offline voucher cannot
+        // answer a comprehension check — there is no live device to ask.
+        await intentLock.markFailed(tx.id, 'STEP_UP_FAILED', 'BLOCKED');
         await audit.log('STEP_UP_FAILED', {
-          transactionId: txId,
+          transactionId: tx.id,
           userId,
           data: { reason: 'semantic verification required but not obtainable for an offline voucher' },
         });
         throw new PrismError(
           403,
           'STEP_UP_FAILED',
-          'This offline payment needs verification that can only happen online.'
+          'This payment needs a verification step that can only be done online.'
         );
       }
 
       if (risk.decision === 'BLOCK') {
-        await intentLock.markFailed(txId, 'RISK_BLOCKED', 'BLOCKED');
+        await intentLock.markFailed(tx.id, 'RISK_BLOCKED', 'BLOCKED');
         await audit.log('PAYMENT_BLOCKED', {
-          transactionId: txId,
+          transactionId: tx.id,
           userId,
-          data: { failureCode: 'RISK_BLOCKED', score: risk.score, reasons: risk.reasons, offline: true },
+          data: {
+            failureCode: 'RISK_BLOCKED',
+            score: risk.score,
+            reasons: risk.reasons,
+            offline: true,
+          },
         });
         throw new PrismError(403, 'RISK_BLOCKED', 'This payment was blocked as high risk.', {
           score: risk.score,
@@ -326,37 +291,40 @@ export class OfflineRedeemModule {
         });
       }
 
-      await attestationChain.append(txId, 'RISK_APPROVED', {
+      await attestationChain.append(tx.id, 'RISK_APPROVED', {
         score: risk.score,
         decision: risk.decision,
         firedRuleIds: risk.firedRuleIds,
       });
+      await attestationChain.append(tx.id, 'SETTLEMENT_AUTHORIZED', { mode: 'NORMAL', offline: true });
 
-      await attestationChain.append(txId, 'SETTLEMENT_AUTHORIZED', { mode: 'NORMAL' });
       const capability = await attestationChain.mintCapability(
-        txId,
-        1,
-        claimedHash,
+        tx.id,
+        attempt,
+        tx.intent_hash,
         REQUIRED_STAGES,
         'NORMAL',
         policy.intentTtlSeconds
       );
-      await query(`UPDATE transactions SET status = 'AUTHORIZED' WHERE id = $1`, [txId]);
+      await query(
+        `UPDATE transactions SET status = 'AUTHORIZED', authorized_offline = TRUE WHERE id = $1`,
+        [tx.id]
+      );
       await audit.log('SETTLEMENT_AUTHORIZED', {
-        transactionId: txId,
+        transactionId: tx.id,
         userId,
-        data: { attempt: 1, mode: 'NORMAL', capabilityId: capability.id, offline: true },
+        data: { attempt, mode: 'NORMAL', capabilityId: capability.id, offline: true },
       });
 
       const result = await settlement.settle(tx, capability);
-      await intentLock.consumeNonce(nonce);
+      await intentLock.consumeNonce(tx.nonce);
       await context.updateBaseline(userId, snapshot);
 
-      await markVoucherOutcome(nonce, 'SETTLED', null, txId);
+      await markVoucherOutcome(tx.nonce, 'SETTLED', null);
       await audit.log('OFFLINE_VOUCHER_REDEEMED', {
-        transactionId: txId,
+        transactionId: tx.id,
         userId,
-        data: { grantId: grant.grantId, amountMinor: intent.amountMinor },
+        data: { grantId: grant.grantId, amountMinor, lateBySeconds },
       });
 
       return {
@@ -366,21 +334,15 @@ export class OfflineRedeemModule {
         settledAt: result.settledAt.toISOString(),
         balanceMinor: result.payerBalanceMinor,
         balanceFormatted: formatMinor(result.payerBalanceMinor),
-        txId,
+        txId: tx.id,
+        lateBySeconds,
       };
     } catch (err) {
       const failureCode = err instanceof PrismError ? err.failureCode : 'INTERNAL_ERROR';
-      await markVoucherOutcome(nonce, 'FAILED', failureCode, txId).catch(() => {});
-      if (txId) {
-        // A row was inserted (the failure is at or after the signature
-        // check) — terminate it rather than leaving it PENDING forever. A
-        // failure before insertion (tamper/envelope checks) leaves txId null
-        // and there is nothing here to terminate.
-        await intentLock.markFailed(txId, failureCode, 'BLOCKED').catch(() => {});
-      }
+      await markVoucherOutcome(tx.nonce, 'FAILED', failureCode).catch(() => {});
       if (err instanceof PrismError) {
         await audit.log('OFFLINE_VOUCHER_REJECTED', {
-          transactionId: txId,
+          transactionId: tx.id,
           userId,
           data: { failureCode, reason: err.message, details: err.details ?? null },
         });

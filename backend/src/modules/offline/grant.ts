@@ -35,13 +35,8 @@ export interface AllowedPayee {
   handle: string;
 }
 
-export interface OfflineSlot {
-  txId: string;
-  nonce: string;
-}
-
 export interface GrantBody {
-  typ: 'prism.offline.grant.v1';
+  typ: 'prism.offline.grant.v2';
   grantId: string;
   payerUserId: string;
   payerAccountId: string;
@@ -50,7 +45,6 @@ export interface GrantBody {
   currency: string;
   maxAmountMinor: number;
   allowedPayees: AllowedPayee[];
-  slots: OfflineSlot[];
   issuedAt: number;
   notAfter: number;
 }
@@ -95,13 +89,9 @@ export class OfflineGrantModule {
 
     const issuedAt = Math.floor(Date.now() / 1000);
     const notAfter = issuedAt + policy.offline.windowSeconds;
-    const slots: OfflineSlot[] = Array.from({ length: policy.offline.slots }, () => ({
-      txId: crypto.randomUUID(),
-      nonce: generateNonce(),
-    }));
 
     const grant: GrantBody = {
-      typ: 'prism.offline.grant.v1',
+      typ: 'prism.offline.grant.v2',
       grantId: crypto.randomUUID(),
       payerUserId: userId,
       payerAccountId,
@@ -113,7 +103,6 @@ export class OfflineGrantModule {
         displayName: p.display_name,
         handle: p.handle,
       })),
-      slots,
       issuedAt,
       notAfter,
     };
@@ -122,17 +111,20 @@ export class OfflineGrantModule {
     const mac = keyManager.macGrant(body);
     const token = `${Buffer.from(body, 'utf8').toString('base64url')}.${mac}`;
 
+    // slots is kept as an empty array: migration 003 declared the column NOT
+    // NULL and migrations here are append-only, so v2 writes [] rather than
+    // editing an applied migration. The replay key is the transaction's own
+    // nonce now — see redeem.ts.
     await query(
       `INSERT INTO offline_grants (id, user_id, envelope, slots, issued_at, not_after)
-       VALUES ($1,$2,$3,$4, to_timestamp($5), to_timestamp($6))`,
-      [grant.grantId, userId, JSON.stringify(grant), JSON.stringify(slots), issuedAt, notAfter]
+       VALUES ($1,$2,$3,'[]'::jsonb, to_timestamp($4), to_timestamp($5))`,
+      [grant.grantId, userId, JSON.stringify(grant), issuedAt, notAfter]
     );
 
     await audit.log('OFFLINE_GRANT_ISSUED', {
       userId,
       data: {
         grantId: grant.grantId,
-        slots: slots.length,
         maxAmountMinor: grant.maxAmountMinor,
         allowedPayeeCount: grant.allowedPayees.length,
         notAfter,
@@ -163,7 +155,12 @@ export class OfflineGrantModule {
       fail('GRANT_INVALID', { reason: 'body is not valid JSON' });
       throw new Error('unreachable'); // fail() never returns; satisfies the compiler
     }
-    if (grant.typ !== 'prism.offline.grant.v1') fail('GRANT_INVALID', { reason: 'wrong token type' });
+    if (grant.typ !== 'prism.offline.grant.v2') {
+      // A v1 token is a grant from the pre-rewrite slot design still sitting
+      // in some browser's localStorage. Refusing it is correct: its envelope
+      // does not mean what this code thinks it means.
+      fail('GRANT_INVALID', { reason: 'wrong or outdated token type — re-arm this device' });
+    }
     return grant;
   }
 
@@ -173,8 +170,13 @@ export class OfflineGrantModule {
    * not — a forged token should fail before a query is even issued.
    */
   async assertLive(grant: GrantBody): Promise<void> {
-    if (Math.floor(Date.now() / 1000) > grant.notAfter) {
-      fail('GRANT_EXPIRED', { reason: 'offline window has closed' });
+    // The deadline that binds a REDEMPTION is the grant window plus the
+    // reconnect grace — not the 90-second intent window, which no real
+    // blackout respects. This is the whole reason an offline voucher can
+    // settle at all; see policy.offline.redeemGraceSeconds.
+    const deadline = grant.notAfter + policy.offline.redeemGraceSeconds;
+    if (Math.floor(Date.now() / 1000) > deadline) {
+      fail('GRANT_EXPIRED', { reason: 'offline window and its reconnect grace have both closed' });
     }
     const { rows } = await query<{ revoked_at: Date | null }>(
       `SELECT revoked_at FROM offline_grants WHERE id = $1`,
@@ -185,9 +187,9 @@ export class OfflineGrantModule {
   }
 
   /** For the /offline/grant status endpoint — what the client renders while armed. */
-  async current(userId: string): Promise<{ grantId: string; notAfter: string; slots: number } | null> {
-    const { rows } = await query<{ id: string; not_after: Date; slots: unknown[] }>(
-      `SELECT id, not_after, slots FROM offline_grants
+  async current(userId: string): Promise<{ grantId: string; notAfter: string } | null> {
+    const { rows } = await query<{ id: string; not_after: Date }>(
+      `SELECT id, not_after FROM offline_grants
         WHERE user_id = $1 AND revoked_at IS NULL AND not_after > NOW()
         ORDER BY issued_at DESC LIMIT 1`,
       [userId]
@@ -196,7 +198,6 @@ export class OfflineGrantModule {
     return {
       grantId: rows[0].id,
       notAfter: rows[0].not_after.toISOString(),
-      slots: rows[0].slots.length,
     };
   }
 }
