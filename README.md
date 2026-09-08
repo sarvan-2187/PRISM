@@ -355,6 +355,80 @@ there is no secure-context requirement.
 
 ---
 
+## Offline behavior
+
+Two different things are meant by "offline" in PRISM, and only one of them is
+actually designed to work with no connection:
+
+### The web portal has no queued/"outbox" payments, by design
+
+Settlement is server-authoritative and every intent, step-up window and
+capability is short-lived on purpose (`policy.intentTtlSeconds`,
+`policy.stepUp.authenticatorTtlSeconds` = 60s) — see [Risk scoring](#risk-scoring--the-points-rules)
+and `authorizationPolicy.ts`. Queuing a payment while offline and firing it
+later would mean authorizing it against risk/context signals that are already
+stale by the time it actually sends, which defeats the reason those windows
+are short. So the portal does **not** queue payments; it just needs to fail
+*honestly* when the browser has no connection, instead of the confusing mix of
+404s/500s/misattributed passkey errors that used to show up depending on
+exactly which request was in flight when the connection dropped.
+
+What changed (`frontend/src/lib/api-client.ts`, `useOnline.ts`, `session.tsx`,
+`Pay.tsx`, `Review.tsx`, `Verify.tsx`, `App.tsx`):
+
+- **`OfflineError`, distinct from `ApiError`.** `api-client.ts`'s `request()`
+  checks `navigator.onLine` before every call and reclassifies a fetch-level
+  `TypeError` (the browser's own "could not reach the server" failure) as
+  `OfflineError` too. No failure code exists for it because the server was
+  never reached — call sites that used to lump this in with "wrong passkey"
+  or "signed out" now check for it first.
+- **The root cause: `session.tsx` no longer signs you out on a network
+  blip.** `refresh()` used to treat *any* failure of `GET /me` — connectivity
+  loss included — as "not signed in" and clear the session, which made
+  `RequireSession` bounce a payment mid-flow back to the sign-in screen the
+  instant one poll found the network gone. It now only clears the session on
+  a real failure (a genuine 401); an `OfflineError` leaves the last-known
+  session in place and sets a separate `offline` flag instead.
+- **A visible "You're offline" banner** (`App.tsx`) whenever
+  `navigator.onLine` is false, everywhere except the pre-login landing page.
+- **Submit buttons disable themselves while offline** on Pay, Review
+  (Approve) and Verify (step-up confirm, "Generate a new code"), so nothing
+  is even attempted against a connection that's already known to be down.
+- **Nothing is ever left half-created.** The offline check runs before the
+  request fires, so a payment either never leaves the browser or the server
+  already has the authoritative record of it — there is no local "pending"
+  state to reconcile. Review/Verify screens that failed to load while offline
+  retry automatically the moment `online` flips back to `true`.
+- A step-up code that expires because the 60-second window ran out while you
+  were offline now says so plainly ("this is a freshness check, not a
+  risk-score decision") instead of reading like an unexplained refusal.
+
+### PRISM Authenticator (`auth_expo_app/`) genuinely works with zero network
+
+This one *is* designed to run with the phone in airplane mode, and it was
+verified line-by-line while fixing the portal above — no network code exists
+anywhere in the scan → verify → generate-code path:
+
+- `screens/Scan.tsx` only calls `verifyToken()` (local Ed25519 check against
+  the public key fetched once at pairing) — no `fetch` in the file.
+- `screens/Code.tsx` only calls `approvalCode()` / `denialCode()` from
+  `lib/otp.ts` (pure HMAC-SHA256 over the locally-stored secret and the
+  token's `intentHash`) — no `fetch` in the file either.
+- `App.tsx` loads the pairing record and cached server key from
+  `expo-secure-store` on launch (`lib/store.ts`), not from the network.
+- The **only** network calls in the whole app are pairing
+  (`/authenticator/pair/start` + `/confirm`, once, from the portal and the
+  phone respectively) and re-fetching `/.well-known/prism-keys` if the cached
+  key is missing. After that, scanning a code and generating the 6 digits
+  needs no signal at all — this matches the design in
+  `docs/superpowers/specs/2026-09-07-prism-authenticator-design.md` §3.
+
+If a paired phone ever fails to produce a code offline, that is a regression
+in `Scan.tsx`/`Code.tsx`/`lib/verify.ts`/`lib/otp.ts` specifically — it is not
+supposed to need a signal at any point after pairing.
+
+---
+
 ## Current state (M0 complete)
 
 | Area | State |
