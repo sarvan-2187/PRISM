@@ -19,6 +19,8 @@ import { LiveLog } from '@/components/LiveLog';
 import { usePoll } from '@/lib/usePoll';
 import { useSession } from '@/lib/session';
 import { useOnline } from '@/lib/useOnline';
+import { addVoucher, grantCovers, hasVoucherFor, loadGrant, type ArmedGrant } from '@/lib/offline-store';
+import { syncOutbox } from '@/lib/offline-sync';
 import { isTerminal } from '@/lib/events';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -33,12 +35,47 @@ const STEPS = ['Person', 'Device', 'Transaction', 'Context', 'Authorization'] as
 export default function Review() {
   const { txId = '' } = useParams();
   const navigate = useNavigate();
-  const { refresh } = useSession();
+  const { refresh, me } = useSession();
   const online = useOnline();
   const [tx, setTx] = useState<TransactionView | null>(null);
   const [remaining, setRemaining] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
+  const [armed, setArmed] = useState<ArmedGrant | null>(null);
+  const [queuedOffline, setQueuedOffline] = useState(false);
+
+  const userId = me?.userId ?? '';
+
+  // What this device may still approve without a server. Re-read whenever
+  // connectivity flips, because Home re-arms the moment it is back.
+  useEffect(() => {
+    if (!userId) return;
+    setArmed(loadGrant(userId));
+    setQueuedOffline(hasVoucherFor(userId, txId));
+  }, [userId, txId, online]);
+
+  // Connectivity is back and this payment was approved during the blackout:
+  // redeem it now, without waiting for the payer to find the Offline page.
+  // This is the "settles when the link returns" half of the card.
+  useEffect(() => {
+    if (!online || !userId || !hasVoucherFor(userId, txId)) return;
+    let cancelled = false;
+    void (async () => {
+      const results = await syncOutbox(userId);
+      if (cancelled) return;
+      setQueuedOffline(hasVoucherFor(userId, txId));
+      const mine = results.find((r) => r.txId === txId);
+      if (!mine) return;
+      await refresh();
+      // Settled or refused, the outcome and its reasons belong on Status —
+      // the same screen an online approval ends on.
+      navigate(`/pay/${txId}/status`);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [online, userId, txId]);
 
   const load = useCallback(async () => {
     try {
@@ -91,6 +128,44 @@ export default function Review() {
     },
   });
 
+  /**
+   * Approve with no network at all — BLACKOUT (FC-01-A).
+   *
+   * Everything needed is already on this device. `tx.intentHash` is the
+   * server's own value, computed when the payment was locked and handed over
+   * while the link was still up, and the passkey prompt is local hardware.
+   * So the signature that authorizes this exact payment can be produced with
+   * nothing reachable — no /challenge call, no /authorize call.
+   *
+   * The result is queued, not sent. On reconnect it is redeemed once, and
+   * once only: the server's replay guard is keyed to this transaction's own
+   * nonce, so a copy of this voucher lifted off the device settles nothing.
+   */
+  async function approveOffline(armedGrant: ArmedGrant, current: TransactionView) {
+    setBusy(true);
+    setError(null);
+    try {
+      const assertion = await webauthn.approve({
+        challenge: current.intentHash,
+        userVerification: 'required',
+      });
+      addVoucher(userId, {
+        token: armedGrant.token,
+        txId: current.txId,
+        intentHash: current.intentHash,
+        assertion,
+        approvedAtMs: Date.now(),
+        amountFormatted: current.amountFormatted,
+        payeeName: current.payeeName,
+      });
+      setQueuedOffline(true);
+    } catch (err) {
+      setError({ code: 'PASSKEY', message: describeWebAuthnError(err) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function approve() {
     setBusy(true);
     setError(null);
@@ -114,15 +189,23 @@ export default function Review() {
       navigate(`/pay/${txId}/status`);
     } catch (err) {
       if (err instanceof OfflineError) {
-        // Whichever call dropped — /challenge or /authorize — nothing was
-        // charged: the passkey signature only ever authorizes THIS intent
-        // hash, and settlement only happens if /authorize's response reaches
-        // the browser. Staying on this screen (never navigating to Status,
-        // never treating it as a passkey failure) lets the same click retry
-        // cleanly once the connection is back.
+        // The blackout landed mid-approval. Nothing was charged: settlement
+        // only happens if /authorize's response reaches the browser.
+        //
+        // If this device was armed while it was still online, it does not
+        // have to wait — it can complete the authentication locally right
+        // now and queue the result. That is the whole point of the card.
+        const grant = loadGrant(userId);
+        if (tx && grantCovers(grant, tx.payeeHandle, tx.amountMinor)) {
+          setBusy(false);
+          await approveOffline(grant!, tx);
+          return;
+        }
         setError({
           code: 'OFFLINE',
-          message: "You're offline. Nothing was charged — reconnect and approve again.",
+          message: grant
+            ? "You're offline, and this payment is outside what this device was armed for. Nothing was charged — reconnect and approve again."
+            : "You're offline and this device was not armed for offline approval. Nothing was charged — reconnect and approve again.",
         });
       } else if (err instanceof ApiError) {
         // Terminal refusals belong on the status screen with the full reasons.
@@ -195,6 +278,13 @@ export default function Review() {
   }
 
   const expired = remaining <= 0;
+  // Can this device finish the payment with no server? Only if it was armed
+  // while online AND the grant's sealed envelope covers this exact payment.
+  const canApproveOffline = grantCovers(armed, tx.payeeHandle, tx.amountMinor);
+  // The 90-second intent window is not the bound that applies to an offline
+  // approval — the grant window is — so a countdown that ran out while the
+  // link was down must not hide the offline button. See policy.offline.
+  const offlineMode = !online && canApproveOffline && !queuedOffline;
   // Before the passkey prompt the transaction is locked and waiting; during
   // it, the context checks are what happens next.
   const activeStep = busy ? 3 : 2;
@@ -263,7 +353,42 @@ export default function Review() {
             recipient and the signature no longer verifies against it.
           </p>
 
-          {expired ? (
+          {queuedOffline ? (
+            <>
+              <Alert variant="success" className="mt-5">
+                <AlertDescription>
+                  <strong className="font-medium">Approved offline.</strong> Your passkey signed
+                  this exact payment on this device, with nothing reachable. It settles by itself
+                  the moment you reconnect — and it can only settle once.
+                </AlertDescription>
+              </Alert>
+              <Button asChild variant="secondary" block className="mt-4">
+                <Link to="/offline">See what is queued</Link>
+              </Button>
+            </>
+          ) : offlineMode ? (
+            <>
+              <Alert variant="warning" className="mt-5">
+                <AlertDescription>
+                  No connection — but this device was armed while it had one, so it can still
+                  approve this payment locally. Your passkey signs the same fingerprint shown
+                  above; PRISM settles it when you reconnect.
+                </AlertDescription>
+              </Alert>
+              <div className="mt-4 flex flex-wrap gap-2 max-md:flex-col">
+                <Button
+                  className="flex-1"
+                  onClick={() => armed && approveOffline(armed, tx)}
+                  disabled={busy}
+                >
+                  {busy ? 'Waiting for your passkey…' : `Approve ${tx.amountFormatted} offline`}
+                </Button>
+                <Button asChild variant="secondary" className="max-md:w-full">
+                  <Link to="/home">Cancel</Link>
+                </Button>
+              </div>
+            </>
+          ) : expired ? (
             <>
               <Alert variant="warning" className="mt-5">
                 <AlertDescription>
@@ -279,22 +404,18 @@ export default function Review() {
             <>
               <Alert variant="warning" className="mt-5">
                 <AlertDescription>
-                  No connection. This screen needs one — the Offline page approves a payment with
-                  none, from a grant armed while you still had a connection.
+                  No connection, and this device is not armed for offline approval of this
+                  payment. Nothing was charged — reconnect and approve again.
                 </AlertDescription>
               </Alert>
-              <Button asChild block className="mt-4">
-                <Link to="/offline">Go to Offline</Link>
+              <Button asChild variant="secondary" block className="mt-4">
+                <Link to="/offline">Offline status</Link>
               </Button>
             </>
           ) : (
             <div className="mt-5 flex flex-wrap gap-2 max-md:flex-col">
-              <Button className="flex-1" onClick={approve} disabled={busy || !online}>
-                {busy
-                  ? 'Waiting for your passkey…'
-                  : !online
-                    ? "You're offline"
-                    : `Approve ${tx.amountFormatted}`}
+              <Button className="flex-1" onClick={approve} disabled={busy}>
+                {busy ? 'Waiting for your passkey…' : `Approve ${tx.amountFormatted}`}
               </Button>
               <Button asChild variant="secondary" className="max-md:w-full">
                 <Link to="/home">Cancel</Link>
