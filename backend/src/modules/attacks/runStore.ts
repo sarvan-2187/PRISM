@@ -29,6 +29,7 @@ export type PrismLayer =
   | 'AUTHORIZATION'
   | 'LEDGER'
   | 'NETWORK'
+  | 'QR'
   | 'NONE';
 
 export interface AttackRunRow {
